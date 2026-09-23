@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 4278a2d6f530556cf77b700589f77e829699fde0323ed50ce42a1759ac7ed4fe
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 a516de0fe4ba196a445b2234c0cf27c61ad9015c30c74db2c227a7d5dc04f27e
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -117,6 +117,15 @@ and silently, so nothing is logged.
 - Check the card before trusting the image: read the whole card back and compare
   with `image/*.img` (`sudo dd if=/dev/sdX bs=4M count=1024 | sha256sum`), and
   watch `dmesg` for I/O errors on the reader.
+- `/usr/libexec/rc/sh/openrc-run.sh: line 15: can't create
+  /proc/sys/kernel/hotplug: nonexistent directory` (the line number belongs to
+  `/etc/init.d/mdev`, which openrc sources) is the same kind of noise:
+  `/proc/sys/kernel/hotplug` only exists with `CONFIG_UEVENT_HELPER`, and the
+  BSP kernel is built without it (`# CONFIG_UEVENT_HELPER is not set`). Device
+  nodes come from devtmpfs (`CONFIG_DEVTMPFS_MOUNT=y`), so both writers in
+  `/etc/init.d/mdev` are guarded in the build. Side effect of a missing uevent
+  helper: `mdev.conf` rules only run at coldplug, so hotplugged devices get
+  their devtmpfs node but no per-owner/mode fixup or `$MODALIAS` autoload.
 
 ## Packages
 

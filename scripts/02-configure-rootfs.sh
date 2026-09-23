@@ -108,6 +108,17 @@ tar -xzf "$WORK/kernel/$KDIR/modules-$KREL.tar.gz" -C "$ROOT/lib/modules"
 ls "$ROOT/lib/modules"
 [ -d "$ROOT/lib/modules/$KREL" ] || { echo "BSP modules did not extract to /lib/modules/$KREL" >&2; exit 1; }
 
+echo "--- mdev hotplug-helper writes (kernel has no CONFIG_UEVENT_HELPER)"
+# /etc/init.d/mdev writes /proc/sys/kernel/hotplug, which only exists when the
+# kernel is built with CONFIG_UEVENT_HELPER. The BSP kernel is not, so openrc
+# logs "can't create /proc/sys/kernel/hotplug: nonexistent directory" on boot
+# and shutdown. Device nodes come from devtmpfs (CONFIG_DEVTMPFS_MOUNT=y), so
+# guard the writes instead of leaving the noise in the log.
+sed -i -e 's|^\techo "/sbin/mdev" > /proc/sys/kernel/hotplug|\t[ -e /proc/sys/kernel/hotplug ] \&\& echo "/sbin/mdev" > /proc/sys/kernel/hotplug|' \
+       -e 's|^\techo > /proc/sys/kernel/hotplug|\t[ -e /proc/sys/kernel/hotplug ] \&\& echo > /proc/sys/kernel/hotplug|' \
+  "$ROOT/etc/init.d/mdev"
+grep -n "hotplug" "$ROOT/etc/init.d/mdev"
+
 echo "--- extlinux.conf"
 cat > "$ROOT/boot/extlinux/extlinux.conf" <<EOF
 TIMEOUT 30
