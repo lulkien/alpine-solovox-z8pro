@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 ad660cbc92d5d3f20743ce316d52e66d3d2fb626c47749be5a08a6e2546448dd
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 4278a2d6f530556cf77b700589f77e829699fde0323ed50ce42a1759ac7ed4fe
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -68,15 +68,55 @@ DEFAULT bsp
 LABEL bsp          # vendor DTB + Z8Pro ethernet overlay (see below)
   LINUX /boot/vmlinuz-6.18.53-ophub
   FDT   /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
-  APPEND root=PARTUUID=abcd1234-01 rw rootwait console=tty0 console=ttyS0,115200 ... video=HDMI-A-1:1920x1080@60e
+  APPEND root=PARTUUID=abcd1234-01 rw rootfstype=ext4 rootwait
+         console=ttyS0,115200 console=tty0 panic=30 ...
+         clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 LABEL bsp-nofix    # same kernel, unpatched vendor DTB
   FDT   /boot/dtbs/allwinner/sun50i-h618-x98h.dtb
+LABEL debug        # explicit /dev/mmcblk0p1, no rootwait, loglevel=8
+  LINUX /boot/vmlinuz-6.18.53-ophub
+  APPEND root=/dev/mmcblk0p1 rw rootfstype=ext4 ignore_loglevel loglevel=8
+         panic=15 console=ttyS0,115200 console=tty0 ...
 LABEL mainline     # Alpine 6.12.110, no wired Ethernet
   LINUX /boot/vmlinuz-lts
 ```
 
 `root=PARTUUID=` (not `UUID=`) is used so the same image boots from SD and from
 eMMC without editing the cmdline.
+
+Three cmdline details are deliberate:
+
+- **`console=tty0` last.** The kernel gives `/dev/console` to the last
+  `console=` entry. With `console=ttyS0` last, all userspace output (OpenRC,
+  service logs, login) went to the unattached UART and the HDMI screen looked
+  frozen even on a healthy boot.
+- **`rootfstype=ext4`, `panic=`.** Without `rootfstype` the kernel probes
+  filesystem types; `panic=` reboots on a panic instead of freezing, so a
+  failure re-prints on screen where there is no serial console.
+- **`clk_ignore_unused`, `pm_genpd_ignore_unused`.** The vendor DTB does not
+  describe every clock/power domain the SoC has, and late init can otherwise
+  gate something the boot still needs.
+
+## Boot debugging (HDMI-only board)
+
+Symptom seen once: kernel messages stop after the eMMC boot partition line
+(`mmcblk1boot1: mmc1:0001 AJNB4R 4.00MiB`), then an idle blinking cursor and no
+OpenRC output. That is the signature of the kernel **not reaching userspace** —
+with `rootwait` on the cmdline a missing/undetected root device waits forever
+and silently, so nothing is logged.
+
+- `check access for rdinit=/init failed: -2, ignoring` is a **kernel** warning
+  from `init/main.c` (6.16+). It fires whenever there is no initramfs, i.e. by
+  design here, and is harmless; an upstream patch exists to stop printing it
+  unless `rdinit=` was passed explicitly.
+- To find the real stop: set `DEFAULT debug` on the card and boot. The kernel
+  then uses `/dev/mmcblk0p1` instead of a PARTUUID, drops `rootwait`, raises the
+  loglevel, and panics+reboots on failure — so either the boot log shows the
+  actual error, or `VFS: Cannot open root device` repeats, which means the SD
+  card is not being detected at all.
+- Check the card before trusting the image: read the whole card back and compare
+  with `image/*.img` (`sudo dd if=/dev/sdX bs=4M count=1024 | sha256sum`), and
+  watch `dmesg` for I/O errors on the reader.
 
 ## Packages
 
@@ -93,9 +133,9 @@ functional set:
 | kernel | `linux-lts` (Alpine 6.12.110), `mkinitfs`, `kmod`, BSP `6.18.53-ophub` on disk |
 | misc | `tzdata`, `ca-certificates-bundle`, `musl`, `libcrypto3`, `linux-firmware` |
 
-No `dhcpcd` (busybox `udhcpc` is the DHCP client) and no `dropbear` client
-variants (`dropbear-dbclient`/`-ssh`/`-scp`) — the openssh client supplies
-`ssh`/`scp`/`sftp` instead.
+`dropbear` is the ssh server; the openssh client packages are kept for the
+`ssh`/`scp`/`sftp`/`ssh-keygen` CLIs (the `dropbear-dbclient`/`-ssh`/`-scp`
+variants are not installed). No `dhcpcd`: busybox `udhcpc` is the DHCP client.
 
 Login: hostname `solovox`, user `root`, password locked (`/etc/shadow` `root:*`),
 key-only over ssh

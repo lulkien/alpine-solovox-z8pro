@@ -84,6 +84,7 @@ done
 # openssh-server must not be present: dropbear is the ssh server here
 [ -e /mnt/target/usr/sbin/sshd ] && { echo "openssh-server present on image (expected dropbear instead)" >&2; exit 1; }
 echo "--- required paths present"
+grep -q '^LABEL debug$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: debug label missing from extlinux.conf"; exit 1; }
 echo "--- extlinux.conf"
 cat /mnt/target/boot/extlinux/extlinux.conf
 echo "--- u-boot magic on image"

@@ -114,24 +114,38 @@ TIMEOUT 30
 DEFAULT bsp
 MENU TITLE Solovox Z8Pro Alpine
 
+# Pick a label by editing DEFAULT (no serial console on this board).
+# `debug` replaces the PARTUUID with an explicit /dev/mmcblk0p1, drops
+# rootwait and raises the loglevel, so a missing root panics and reboots
+# instead of waiting silently forever.
+# `console=tty0` is last on purpose: /dev/console goes to the last console=
+# entry, and userspace output (OpenRC, service logs, login) has to appear on
+# HDMI, not on the unattached UART.
+
 LABEL bsp
   MENU LABEL Alpine (BSP kernel $KREL, Z8Pro ethfix)
   LINUX /boot/vmlinuz-$KREL
   FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
-  APPEND root=PARTUUID=$ROOT_PARTUUID rw rootwait console=tty0 console=ttyS0,115200 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 video=HDMI-A-1:1920x1080@60e
+  APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 
 LABEL bsp-nofix
   MENU LABEL Alpine (BSP kernel $KREL, unpatched vendor DTB)
   LINUX /boot/vmlinuz-$KREL
   FDT /boot/dtbs/allwinner/sun50i-h618-x98h.dtb
-  APPEND root=PARTUUID=$ROOT_PARTUUID rw rootwait console=tty0 console=ttyS0,115200 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 video=HDMI-A-1:1920x1080@60e
+  APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
+
+LABEL debug
+  MENU LABEL Alpine debug (BSP kernel, explicit /dev/mmcblk0p1, loglevel=8)
+  LINUX /boot/vmlinuz-$KREL
+  FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
+  APPEND root=/dev/mmcblk0p1 rw rootfstype=ext4 ignore_loglevel loglevel=8 panic=15 console=ttyS0,115200 console=tty0 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 
 LABEL mainline
   MENU LABEL Alpine (mainline linux-lts, no wired ethernet)
   LINUX /boot/vmlinuz-lts
   INITRD /boot/initramfs-lts
   FDT /boot/dtbs-lts/allwinner/sun50i-h618-transpeed-8k618-t.dtb
-  APPEND root=PARTUUID=$ROOT_PARTUUID rw rootwait console=tty0 console=ttyS0,115200 max_loop=128 net.ifnames=0
+  APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 max_loop=128 net.ifnames=0
 EOF
 
 echo "--- resulting /boot"
