@@ -1,0 +1,196 @@
+# Alpine Linux for the X98H (Allwinner H618) TV box
+
+Built on an x86_64 host; nothing runs on the board during the build. Target
+board: X98H, H618, 2–4 GB LPDDR, SD card (`mmcblk0`) + 14.6 GB eMMC
+(`mmcblk2`), 100M Ethernet behind RMII, Mali-G31 (panfrost), NEC IR receiver.
+
+## Result
+
+```
+image/alpine-x98h-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
+image/alpine-x98h-3.22.6-6.18.53.img.sha256 7cc0738dce360994c5abc9622c690ca2093a083a4c6bd696467b9a074c4c55d2
+```
+
+Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
+the kernel and the rootfs.
+
+## Kernel choice: Allwinner BSP, not Alpine mainline
+
+The wired port of this box is not usable with a mainline kernel:
+
+- `sun50i-h616.dtsi` (checked at v6.12 and v6.18) defines **only `emac0`**
+  (GMAC at 0x5020000). There is no `emac1` node.
+- The X98H vendor DTB enables **`ethernet@5030000` (emac1)** with
+  `phy-mode = "rmii"`, `phy-handle` to `ethernet-phy@1`, and `emac0` disabled —
+  this is the port the RJ45 is wired to, and why Armbian carries an `ethfix`
+  overlay for RMII clock delays.
+- `dwmac-sun8i.c` has no H616 EMAC200 (emac1) support to drive it.
+
+So the image ships the BSP kernel the board already ran in production
+(`6.18.53-ophub` from the [ophub/kernel](https://github.com/ophub/kernel)
+`kernel_stable` release), paired with the Alpine 3.22 userspace. That kernel has
+the hardware baked in:
+
+| Requirement | Config |
+|---|---|
+| boot without initramfs | `CONFIG_MMC_SUNXI=y`, `CONFIG_EXT4_FS=y` |
+| wired Ethernet (emac1) | `CONFIG_DWMAC_SUN8I=y`, `CONFIG_STMMAC_ETH=y` |
+| HDMI console | `CONFIG_DRM_SUN8I_DW_HDMI=y`, `CONFIG_DRM_SUN4I=y` |
+| Mali-G31 GPU | `CONFIG_DRM_PANFROST=m` |
+| IR receiver | `CONFIG_IR_SUNXI=m` |
+| PMIC (AXP313) | `CONFIG_SUNXI_RSB=y`, `CONFIG_MFD_AXP20X_RSB=y` |
+
+Alpine's own `linux-lts` (6.12.110) is also installed and selectable as a
+second extlinux entry for comparison/debugging. It boots the board but has no
+wired Ethernet.
+
+## Image layout
+
+```
+offset 8 KiB   u-boot-sunxi-with-spl.bin (Allwinner SPL + u-boot, eGON.BT0)
+offset 1 MiB   MBR partition 1, bootable flag, type 83 (Linux), rest of the disk
+               ext4, LABEL=rootfs, UUID=9f1c7a3e-5b21-4f8d-9a1c-7b2d4e6f8a90
+               PARTUUID=abcd1234-01  (MBR disk id abcd1234)
+```
+
+The bootable flag is not cosmetic: u-boot's `distro_bootcmd` walks only
+partitions from `part list -bootable` and scans them for
+`boot.scr`/`extlinux/extlinux.conf`.
+
+`/boot/extlinux/extlinux.conf`:
+
+```
+TIMEOUT 30
+DEFAULT bsp
+LABEL bsp          # vendor DTB + Z8Pro ethernet overlay (see below)
+  LINUX /boot/vmlinuz-6.18.53-ophub
+  FDT   /boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb
+  APPEND root=PARTUUID=abcd1234-01 rw rootwait console=tty0 console=ttyS0,115200 ... video=HDMI-A-1:1920x1080@60e
+LABEL bsp-nofix    # same kernel, unpatched vendor DTB
+  FDT   /boot/dtbs/allwinner/sun50i-h618-x98h.dtb
+LABEL mainline     # Alpine 6.12.110, no wired Ethernet
+  LINUX /boot/vmlinuz-lts
+```
+
+`root=PARTUUID=` (not `UUID=`) is used so the same image boots from SD and from
+eMMC without editing the cmdline.
+
+## Packages
+
+162 packages; roughly 90 of them are `linux-firmware-*` subpackages. The
+functional set:
+
+| Area | Packages |
+|---|---|
+| init / base | `alpine-base`, `openrc`, `busybox` (+`-openrc`, `-mdev-openrc`, `-suid`, `-binsh`), `mdev-conf`, `alpine-conf`, `alpine-baselayout(-data)`, `alpine-keys`, `alpine-release`, `apk-tools` |
+| ssh server | `dropbear`, `dropbear-openrc` (`DROPBEAR_OPTS="-s"`, host keys generated on first start) |
+| ssh client | `openssh-client-default`, `openssh-client-common`, `openssh-keygen` (ssh/scp/sftp, ssh-keygen) |
+| networking | `ifupdown-ng`, `bridge`, busybox `udhcpc` + `/usr/share/udhcpc/default.script` |
+| filesystems | `e2fsprogs`, `dosfstools`, `cryptsetup-libs`, `device-mapper-libs` |
+| kernel | `linux-lts` (Alpine 6.12.110), `mkinitfs`, `kmod`, BSP `6.18.53-ophub` on disk |
+| misc | `tzdata`, `ca-certificates-bundle`, `musl`, `libcrypto3`, `linux-firmware` |
+
+No `dhcpcd` (busybox `udhcpc` is the DHCP client) and no `dropbear` client
+variants (`dropbear-dbclient`/`-ssh`/`-scp`) — the openssh client supplies
+`ssh`/`scp`/`sftp` instead.
+
+Login: user `root`, password locked (`/etc/shadow` `root:*`), key-only over ssh
+via the `master` ed25519 key in `/root/.ssh/authorized_keys`; dropbear runs with
+`-s` so password auth is refused outright. A tty password set with `passwd`
+therefore only affects local console (tty1..tty6, `getty` on HDMI) and serial
+login (uncomment the `ttyS0` line in `/etc/inittab` for UART).
+
+## Z8Pro / X98H-clone Ethernet overlay
+
+The board's PHY answers at MDIO address 0, while the vendor DTB places it at
+address 1 on emac1's MDIO bus — the link stays down until that is corrected.
+Source overlay:
+
+```
+amlogic-s9xxx-armbian/build-armbian/armbian-files/platform-files/allwinner/
+  bootfs/dtb/allwinner/overlay/sun50i-h618-z8pro.dtbo
+```
+
+which contains a single fragment:
+
+```
+target-path = "/soc/ethernet@5030000/mdio/ethernet-phy@1";
+__overlay__ { reg = <0x0>; };
+```
+
+Two things about it matter for the build:
+
+- That file is **decompiled DTS text**, not a compiled blob (`file` calls it
+  "Device Tree File (v1), ASCII text"), and dtc will not recompile it as-is:
+  its bare `/fragment@0 {}` root form fails with `syntax error`. The canonical
+  `/plugin/;` form is kept at `x98h/sun50i-h618-z8pro-overlay.dts` with
+  identical semantics.
+- The overlay is **merged at build time** (`dtc -@` then `fdtoverlay`) into
+  `/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb`, because this image boots
+  with no initramfs and u-boot's `FDTOVERLAYS` support is not assumed. The
+  compiled `.dtbo` still ships in `/boot/dtbs/allwinner/overlay/` for other
+  boot paths.
+- `02-configure-rootfs.sh` asserts the merge landed (PHY `reg = <0x00>` in the
+  merged blob) and fails the build otherwise. The unpatched DTB remains
+  selectable as the `bsp-nofix` label for A/B comparison.
+
+## Build
+
+Four scripts; inputs are fetched and hash-verified first, then each stage runs
+through a throwaway container so the host needs no extra tooling — only
+`docker` and `qemu-aarch64` binfmt are required.
+
+```bash
+# 0. download + verify inputs (u-boot, minirootfs, ophub kernel release)
+bash scripts/00-fetch-inputs.sh
+
+# 1. Alpine aarch64 rootfs, native apk inside a qemu chroot
+docker run --rm --privileged -v "$PWD":/work debian:trixie \
+  bash /work/scripts/01-bootstrap-rootfs.sh
+
+# 2. X98H config, BSP kernel + modules, extlinux.conf
+docker run --rm --privileged -v "$PWD":/work debian:trixie \
+  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools && bash /work/scripts/02-configure-rootfs.sh'
+
+# 3. image: partition table, ext4, rootfs, u-boot at KiB 8  (needs host /dev for losetup)
+docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
+  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools && bash /work/scripts/03-build-image.sh'
+```
+
+Inputs pulled once into the project tree: the minirootfs tarball, the ophub
+kernel release (`kernel/6.18.53.tar.gz` unpacked to `kernel/boot`,
+`kernel/dtbs`, `kernel/6.18.53/`), and `u-boot-sunxi-with-spl.bin`.
+
+### Bootloader
+
+`u-boot-sunxi-with-spl.bin` (790521 bytes,
+sha256 `4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96`) comes
+from [ophub/u-boot `allwinner/x98h`](https://github.com/ophub/u-boot/tree/main/u-boot/allwinner/x98h)
+— the same known-good binary the Armbian install uses. Its `bootcmd` is
+`run distro_bootcmd` with `boot_targets=fel mmc_auto usb0 pxe dhcp`, so no
+`boot.scr` or `armbianEnv.txt` is involved; extlinux.conf drives the boot.
+Mainline u-boot was not built: `transpeed-8k618-t_defconfig` exists, but the
+SDRAM/PMIC bring-up of this specific box is what the vendor-ish prebuilt gets
+right.
+
+## Notes and follow-ups
+
+- Root login is key-only; `~/.ssh/id_ed25519.pub` ("master") is installed for
+  root, and no password is set — set one with `passwd` over ssh if console
+  login is ever wanted. Serial console (`console=ttyS0,115200`) is enabled but
+  the box was built for HDMI (`console=tty0`).
+- `mkinitfs` unused: the BSP kernel has MMC and ext4 built in, so no initramfs
+  is generated for it. Alpine's `linux-lts` keeps its own `initramfs-lts`.
+- Missing versus the Armbian install: IR keymap/wiring (`/etc/rc_keymaps`, a
+  keymap loader service), the `ethfix`-equivalent RMII delay tuning if the link
+  misbehaves, and eMMC installation. Each is a config change, not a kernel
+  change, because the BSP kernel + DTB already enable those blocks.
+- Alpine `apk upgrade` will update `linux-lts` but knows nothing about the BSP
+  kernel; pin or remove `linux-lts` if a future upgrade should not touch
+  `/boot`.
+- eMMC install: flash the same image to eMMC (`dd` from the running system or
+  the vendor tool) — `root=PARTUUID=abcd1234-01` resolves identically there.
+- The 100M link is the piece to watch on first boot: if it stays down, compare
+  `ip link`/`ethtool` against the Armbian install and tune the RMII delays in
+  the DTB (the vendor DTB may need `allwinner,rx/tx-delay-ps` or an
+  `ethfix`-style overlay port).

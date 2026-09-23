@@ -1,0 +1,7 @@
+/dts-v1/;
+/fragment@0{
+	target-path = "/soc/ethernet@5030000/mdio/ethernet-phy@1";
+	__overlay__{
+		reg = <0x00000000>;
+	};
+};

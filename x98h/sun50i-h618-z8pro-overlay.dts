@@ -1,0 +1,25 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Z8Pro / X98H-clone Ethernet fix.
+ *
+ * Source: amlogic-s9xxx-armbian platform-files,
+ *   armbian-files/platform-files/allwinner/bootfs/dtb/allwinner/overlay/sun50i-h618-z8pro.dtbo
+ * that file is decompiled DTS text (dtc -I dts fails on its bare
+ * "/fragment@0 {}" root form), so it is carried here in canonical plugin form.
+ *
+ * The box's PHY straps to MDIO address 0, while the vendor DTB describes it at
+ * address 1 on emac1's MDIO bus; the link does not come up until the reg
+ * property is corrected.
+ */
+
+/ {
+	fragment@0 {
+		target-path = "/soc/ethernet@5030000/mdio/ethernet-phy@1";
+
+		__overlay__ {
+			reg = <0x0>;
+		};
+	};
+};

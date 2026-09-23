@@ -1,0 +1,25 @@
+# Build inputs fetched by scripts/00-fetch-inputs.sh
+kernel/
+u-boot-sunxi-with-spl.bin
+alpine-minirootfs-*.tar.gz
+
+# Scratch downloads
+*.apk
+apk-tools-static/
+sbin/
+v322_h618.html
+
+# Build outputs
+rootfs/
+image/
+*.img
+*.img.sha256
+
+# Generated device trees (merged/compiled during the build; sources are committed)
+x98h/*.dtbo
+x98h/*-ethfix.dtb
+x98h/x98h.dts
+
+# Editors
+*.swp
+*~
