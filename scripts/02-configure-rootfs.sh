@@ -14,10 +14,10 @@ WORK=/work
 ROOT="$WORK/rootfs"
 KREL=6.18.53-ophub
 KDIR=6.18.53
-BOARD_HOSTNAME=x98h
+BOARD_HOSTNAME=solovox
 ROOT_PARTUUID=abcd1234-01
 TZ_NAME=Asia/Ho_Chi_Minh
-SSH_PUBKEY_FILE="$WORK/x98h/authorized_keys"
+SSH_PUBKEY_FILE="$WORK/board/authorized_keys"
 
 [ -d "$ROOT" ] || { echo "rootfs missing: run 01 first" >&2; exit 1; }
 
@@ -87,16 +87,16 @@ echo "--- Z8Pro / X98H-clone ethernet overlay -> merged DTB"
 # Overlay sets the emac1 MDIO PHY reg from 1 to 0 (clone PHY strapping).
 # Merged at build time: the kernel has no initramfs here to apply overlays,
 # and this u-boot is not relied on for FDTOVERLAYS support.
-dtc -@ -I dts -O dtb -o "$WORK/x98h/sun50i-h618-z8pro.dtbo" "$WORK/x98h/sun50i-h618-z8pro-overlay.dts" 2>/dev/null
+dtc -@ -I dts -O dtb -o "$WORK/board/sun50i-h618-z8pro.dtbo" "$WORK/board/sun50i-h618-z8pro-overlay.dts" 2>/dev/null
 fdtoverlay -i "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" \
-           -o "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb" \
-           "$WORK/x98h/sun50i-h618-z8pro.dtbo"
-install -m 644 "$WORK/x98h/sun50i-h618-z8pro.dtbo" "$ROOT/boot/dtbs/allwinner/overlay/"
+           -o "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" \
+           "$WORK/board/sun50i-h618-z8pro.dtbo"
+install -m 644 "$WORK/board/sun50i-h618-z8pro.dtbo" "$ROOT/boot/dtbs/allwinner/overlay/"
 # The merge must actually have landed: PHY reg 0x00 on the emac1 MDIO bus.
-dtc -I dtb -O dts "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb" 2>/dev/null \
+dtc -I dtb -O dts "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" 2>/dev/null \
   | sed -n '/ethernet-phy@1/,/};/p' | grep -q "reg = <0x00>" \
   || { echo "ethfix overlay did not apply (PHY reg still 1)" >&2; exit 1; }
-echo "    merged: $(ls -l "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb" | awk '{print $5}') bytes"
+echo "    merged: $(ls -l "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" | awk '{print $5}') bytes"
 
 echo "--- BSP modules into /lib/modules"
 # The tarball's top-level directory is already named <KREL>, so it must be
@@ -111,12 +111,12 @@ echo "--- extlinux.conf"
 cat > "$ROOT/boot/extlinux/extlinux.conf" <<EOF
 TIMEOUT 30
 DEFAULT bsp
-MENU TITLE X98H Alpine
+MENU TITLE Solovox Z8Pro Alpine
 
 LABEL bsp
   MENU LABEL Alpine (BSP kernel $KREL, Z8Pro ethfix)
   LINUX /boot/vmlinuz-$KREL
-  FDT /boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb
+  FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
   APPEND root=PARTUUID=$ROOT_PARTUUID rw rootwait console=tty0 console=ttyS0,115200 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 video=HDMI-A-1:1920x1080@60e
 
 LABEL bsp-nofix

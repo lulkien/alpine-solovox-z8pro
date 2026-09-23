@@ -1,14 +1,17 @@
-# Alpine Linux for the X98H (Allwinner H618) TV box
+# Alpine Linux for the Solovox Z8Pro (Allwinner H618 TV box)
 
 Built on an x86_64 host; nothing runs on the board during the build. Target
-board: X98H, H618, 2–4 GB LPDDR, SD card (`mmcblk0`) + 14.6 GB eMMC
-(`mmcblk2`), 100M Ethernet behind RMII, Mali-G31 (panfrost), NEC IR receiver.
+board: a **Solovox Z8Pro** — an X98H clone (H618, 2–4 GB LPDDR, SD card
+`mmcblk0` + 14.6 GB eMMC `mmcblk2`, 100M Ethernet behind RMII, Mali-G31 via
+panfrost, NEC IR receiver). Vendor artifacts keep the `x98h` name in their
+filenames (`sun50i-h618-x98h.dtb`, `ophub/u-boot allwinner/x98h`) because that
+is what upstream calls this hardware family.
 
 ## Result
 
 ```
-image/alpine-x98h-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-x98h-3.22.6-6.18.53.img.sha256 7cc0738dce360994c5abc9622c690ca2093a083a4c6bd696467b9a074c4c55d2
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 7e7c3072a22998d17e84e26643d96f478b11d75efb63a8440298dc5308512e70
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -64,7 +67,7 @@ TIMEOUT 30
 DEFAULT bsp
 LABEL bsp          # vendor DTB + Z8Pro ethernet overlay (see below)
   LINUX /boot/vmlinuz-6.18.53-ophub
-  FDT   /boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb
+  FDT   /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
   APPEND root=PARTUUID=abcd1234-01 rw rootwait console=tty0 console=ttyS0,115200 ... video=HDMI-A-1:1920x1080@60e
 LABEL bsp-nofix    # same kernel, unpatched vendor DTB
   FDT   /boot/dtbs/allwinner/sun50i-h618-x98h.dtb
@@ -94,7 +97,8 @@ No `dhcpcd` (busybox `udhcpc` is the DHCP client) and no `dropbear` client
 variants (`dropbear-dbclient`/`-ssh`/`-scp`) — the openssh client supplies
 `ssh`/`scp`/`sftp` instead.
 
-Login: user `root`, password locked (`/etc/shadow` `root:*`), key-only over ssh
+Login: hostname `solovox`, user `root`, password locked (`/etc/shadow` `root:*`),
+key-only over ssh
 via the `master` ed25519 key in `/root/.ssh/authorized_keys`; dropbear runs with
 `-s` so password auth is refused outright. A tty password set with `passwd`
 therefore only affects local console (tty1..tty6, `getty` on HDMI) and serial
@@ -123,10 +127,10 @@ Two things about it matter for the build:
 - That file is **decompiled DTS text**, not a compiled blob (`file` calls it
   "Device Tree File (v1), ASCII text"), and dtc will not recompile it as-is:
   its bare `/fragment@0 {}` root form fails with `syntax error`. The canonical
-  `/plugin/;` form is kept at `x98h/sun50i-h618-z8pro-overlay.dts` with
+  `/plugin/;` form is kept at `board/sun50i-h618-z8pro-overlay.dts` with
   identical semantics.
 - The overlay is **merged at build time** (`dtc -@` then `fdtoverlay`) into
-  `/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb`, because this image boots
+  `/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb`, because this image boots
   with no initramfs and u-boot's `FDTOVERLAYS` support is not assumed. The
   compiled `.dtbo` still ships in `/boot/dtbs/allwinner/overlay/` for other
   boot paths.
@@ -148,7 +152,7 @@ bash scripts/00-fetch-inputs.sh
 docker run --rm --privileged -v "$PWD":/work debian:trixie \
   bash /work/scripts/01-bootstrap-rootfs.sh
 
-# 2. X98H config, BSP kernel + modules, extlinux.conf
+# 2. board config, BSP kernel + modules, extlinux.conf
 docker run --rm --privileged -v "$PWD":/work debian:trixie \
   bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools && bash /work/scripts/02-configure-rootfs.sh'
 

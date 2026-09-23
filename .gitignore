@@ -16,9 +16,9 @@ image/
 *.img.sha256
 
 # Generated device trees (merged/compiled during the build; sources are committed)
-x98h/*.dtbo
-x98h/*-ethfix.dtb
-x98h/x98h.dts
+board/*.dtbo
+board/*-ethfix.dtb
+board/x98h.dts
 
 # Editors
 *.swp

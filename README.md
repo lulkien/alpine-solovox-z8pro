@@ -1,6 +1,7 @@
 # alpine-solovox-z8pro
 
-Alpine Linux SD/eMMC image for the X98H / Z8Pro-solovox Allwinner H618 TV box.
+Alpine Linux SD/eMMC image for the Solovox Z8Pro, an X98H-clone Allwinner H618
+TV box.
 
 Builds a 4 GiB raw image (u-boot + BSP kernel + Alpine 3.22 rootfs) entirely on
 an x86_64 host: no root, no card reader, no cross toolchain — a qemu binfmt

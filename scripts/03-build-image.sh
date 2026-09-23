@@ -13,7 +13,7 @@ WORK=/work
 ROOT="$WORK/rootfs"
 UBOOT="$WORK/u-boot-sunxi-with-spl.bin"
 IMGDIR="$WORK/image"
-NAME=alpine-x98h-3.22.6-6.18.53
+NAME=alpine-solovox-z8pro-3.22.6-6.18.53
 IMG="$IMGDIR/$NAME.img"
 KREL=6.18.53-ophub
 SIZE_MB="${SIZE_MB:-4096}"
@@ -77,7 +77,7 @@ mount -o ro "$P1" /mnt/target
 MOUNTED=1
 echo "--- boot tree on image"
 ls -l /mnt/target/boot /mnt/target/boot/extlinux
-for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/dropbear" "/etc/init.d/dropbear" "/etc/runlevels/default/dropbear"; do
+for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/dropbear" "/etc/init.d/dropbear" "/etc/runlevels/default/dropbear"; do
   # -L as well: /sbin/init is an absolute symlink and does not resolve on the host
   [ -e "/mnt/target$chk" ] || [ -L "/mnt/target$chk" ] || { echo "MISSING on image: $chk" >&2; exit 1; }
 done
