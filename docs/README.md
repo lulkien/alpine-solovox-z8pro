@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 7e7c3072a22998d17e84e26643d96f478b11d75efb63a8440298dc5308512e70
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 ad660cbc92d5d3f20743ce316d52e66d3d2fb626c47749be5a08a6e2546448dd
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,

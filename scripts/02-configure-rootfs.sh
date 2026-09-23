@@ -87,6 +87,7 @@ echo "--- Z8Pro / X98H-clone ethernet overlay -> merged DTB"
 # Overlay sets the emac1 MDIO PHY reg from 1 to 0 (clone PHY strapping).
 # Merged at build time: the kernel has no initramfs here to apply overlays,
 # and this u-boot is not relied on for FDTOVERLAYS support.
+rm -f "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb" # pre-rename artifact
 dtc -@ -I dts -O dtb -o "$WORK/board/sun50i-h618-z8pro.dtbo" "$WORK/board/sun50i-h618-z8pro-overlay.dts" 2>/dev/null
 fdtoverlay -i "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" \
            -o "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" \
