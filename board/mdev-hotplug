@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+# Hotplug support for a kernel that cannot call a uevent helper.
+#
+# Alpine's mdev service handles hotplug by pointing /proc/sys/kernel/hotplug at
+# /sbin/mdev, which the kernel is supposed to call for every uevent. A kernel
+# built without CONFIG_UEVENT_HELPER (this BSP kernel: the sysctl exists but
+# reads back empty) never calls it. Then a device plugged in after boot gets no
+# /dev node, and its modalias never reaches modprobe — so the driver module it
+# needs is never loaded.
+#
+# The symptom is easy to misread as broken hardware: the kernel enumerates the
+# device, usbhid binds the interfaces, the HID devices appear under
+# /sys/bus/hid/devices/, and still there is no input device and no
+# /dev/input/eventN. A USB keyboard with Apple's vendor id (05ac:024f, which
+# countless wireless dongles clone) needs the hid-apple module for that, and
+# nothing was loading it.
+#
+# mdev's daemon mode listens on the kernel's netlink uevents and does the whole
+# job itself, so run that. It starts after mdev, which populates /dev once at
+# boot, and before anything that might need a freshly plugged device.
+
+description="mdev hotplug daemon (nodes and module loading for devices plugged in later)"
+
+depend() {
+	after mdev
+	before net
+}
+
+start() {
+	ebegin "Starting the mdev hotplug daemon"
+	start-stop-daemon --start --quiet --name mdev --exec /sbin/mdev --background -- -d
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping the mdev hotplug daemon"
+	start-stop-daemon --stop --quiet --name mdev
+	eend $?
+}
