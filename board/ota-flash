@@ -138,14 +138,14 @@ if [ "$SAME_AS_ROOT" = 1 ]; then
 	echo "  note       : this disk carries the running system"
 fi
 
-wget -q --spider "$URL" || die "source not reachable: $URL" 3
+wget -q -T 15 --spider "$URL" || die "source not reachable: $URL" 3
 
 EXPECT_SIZE=""
 EXPECT_HASH=""
-if wget -q -O - "$SIDE_SHA" > /tmp/.ota.sha 2>/dev/null && [ -s /tmp/.ota.sha ]; then
+if wget -q -T 15 -O - "$SIDE_SHA" > /tmp/.ota.sha 2>/dev/null && [ -s /tmp/.ota.sha ]; then
 	EXPECT_HASH=$(awk '{ print $1; exit }' /tmp/.ota.sha)
 fi
-if wget -q -O - "$SIDE_SIZE" > /tmp/.ota.size 2>/dev/null && [ -s /tmp/.ota.size ]; then
+if wget -q -T 15 -O - "$SIDE_SIZE" > /tmp/.ota.size 2>/dev/null && [ -s /tmp/.ota.size ]; then
 	EXPECT_SIZE=$(awk '{ print $1; exit }' /tmp/.ota.size)
 fi
 rm -f /tmp/.ota.sha /tmp/.ota.size
@@ -188,7 +188,7 @@ start=$(date +%s)
 
 if [ "$TEST" = 1 ]; then
 	echo "[test] streaming $URL through gzip, writing nothing"
-	got=$(wget -q -O - "$URL" | gzip -dc | wc -c)
+	got=$(wget -q -T 20 -O - "$URL" | gzip -dc | wc -c)
 	status=$?
 	elapsed=$(( $(date +%s) - start ))
 	[ "$status" = 0 ] || die "stream failed (wget/gzip exit $status)" 5
@@ -204,7 +204,7 @@ if [ "$TEST" = 1 ]; then
 fi
 
 echo "[write] streaming $URL -> $TARGET"
-if ! wget -q -O - "$URL" | gzip -dc | dd of="$TARGET" bs=4M conv=fsync 2>/dev/null; then
+if ! wget -q -T 30 -O - "$URL" | gzip -dc | dd of="$TARGET" bs=4M conv=fsync 2>/dev/null; then
 	echo "[error] write failed; the target may hold a partial image and need a"
 	echo "        re-flash from a card reader on another machine" >&2
 	echo "        (a truncated stream is only detected by the read-back below)" >&2
