@@ -77,7 +77,7 @@ mount -o ro "$P1" /mnt/target
 MOUNTED=1
 echo "--- boot tree on image"
 ls -l /mnt/target/boot /mnt/target/boot/extlinux
-for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/dropbear" "/etc/init.d/dropbear" "/etc/runlevels/default/dropbear" "/etc/runlevels/default/ntpd" "/etc/runlevels/boot/swclock" "/etc/conf.d/ntpd" "/usr/sbin/ota-flash"; do
+for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/dropbear" "/etc/init.d/dropbear" "/etc/runlevels/default/dropbear" "/etc/runlevels/default/ntpd" "/etc/runlevels/boot/swclock" "/etc/conf.d/ntpd" "/usr/sbin/ota-flash" "/bin/busybox.static" "/boot/flash-initramfs.gz"; do
   # -L as well: /sbin/init is an absolute symlink and does not resolve on the host
   [ -e "/mnt/target$chk" ] || [ -L "/mnt/target$chk" ] || { echo "MISSING on image: $chk" >&2; exit 1; }
 done
@@ -85,6 +85,15 @@ done
 [ -e /mnt/target/usr/sbin/sshd ] && { echo "openssh-server present on image (expected dropbear instead)" >&2; exit 1; }
 echo "--- required paths present"
 grep -q '^LABEL debug$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: debug label missing from extlinux.conf"; exit 1; }
+grep -q '^LABEL flash$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: flash label missing from extlinux.conf"; exit 1; }
+grep -q '^DEFAULT bsp$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the image must boot bsp, not flash"; exit 1; }
+gzip -dc "$WORK/rootfs/boot/flash-initramfs.gz" | cpio -t 2>/dev/null | grep -qx 'init' || { echo "FAIL: flash-initramfs.gz has no /init"; exit 1; }
+{ [ -x "$WORK/rootfs/usr/sbin/resize2fs" ] || [ -x "$WORK/rootfs/sbin/resize2fs" ]; } || { echo "FAIL: resize2fs missing from the rootfs (no card expansion possible)"; exit 1; }
+[ -x "$WORK/rootfs/etc/init.d/growfs" ] || { echo "FAIL: growfs service missing from the rootfs"; exit 1; }
+[ -L "$WORK/rootfs/etc/runlevels/boot/growfs" ] || { echo "FAIL: growfs is not enabled in the boot runlevel"; exit 1; }
+[ -x "$WORK/rootfs/etc/init.d/mdev-hotplug" ] || { echo "FAIL: mdev-hotplug service missing (hotplug would be dead)"; exit 1; }
+[ -L "$WORK/rootfs/etc/runlevels/boot/mdev-hotplug" ] || { echo "FAIL: mdev-hotplug is not enabled in the boot runlevel"; exit 1; }
+grep -q 'read_mbr_entry' "$WORK/rootfs/boot/flash-initramfs.gz" 2>/dev/null || true
 echo "--- extlinux.conf"
 cat /mnt/target/boot/extlinux/extlinux.conf
 echo "--- u-boot magic on image"

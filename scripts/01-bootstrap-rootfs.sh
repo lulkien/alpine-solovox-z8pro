@@ -46,7 +46,7 @@ echo "--- apk add"
 chroot "$ROOT" /sbin/apk add --no-cache \
   alpine-base linux-lts alpine-conf \
   dropbear dropbear-openrc openssh-client-default openssh-keygen \
-  e2fsprogs dosfstools
+  e2fsprogs e2fsprogs-extra dosfstools busybox-static cpio
 
 echo "--- installed kernel"
 chroot "$ROOT" /sbin/apk info -e linux-lts || true

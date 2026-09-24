@@ -12,6 +12,7 @@ v322_h618.html
 # Build outputs
 rootfs/
 image/
+flash-initramfs/
 *.img
 *.img.sha256
 

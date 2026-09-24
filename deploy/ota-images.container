@@ -1,21 +1,30 @@
-# Quadlet unit: serve the board OTA images over HTTP on the NAS.
+# Quadlet unit: serve the board OTA release folders over HTTP on the NAS.
 #
 # Install (rootless, user lunarian on luna):
-#   mkdir -p ~/ota-images ~/.config/containers/systemd
+#   mkdir -p ~/.config/containers/systemd
 #   cp ota-images.container ~/.config/containers/systemd/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ota-images.service
 #
-# Layout of ~/ota-images (written by scripts/04-ota-publish.sh):
-#   alpine-solovox-z8pro-<ver>.img.gz          the transfer artifact
-#   alpine-solovox-z8pro-<ver>.img.sha256      sha256 of the raw image
-#   alpine-solovox-z8pro-<ver>.img.size        size of the raw image in bytes
+# Source = the release base written by scripts/04-ota-publish.sh. It is an NFS
+# mount (/srv/remotemount/OTA from 10.21.50.10:/mnt/AppData/OTA), so it holds
+# everything in one place and survives on the storage host. Layout, per release:
 #
-# Clients fetch http://luna:8080/<name>.img.gz and ota-flash derives the two
-# sidecar URLs from it.
+#   <image>-<YYYYmmdd-HHMMSS>/<image>.img.gz       transfer artifact
+#                            /<image>.img.sha256   sha256 of the raw image
+#                            /<image>.img.size     size of the raw image
+#                            /<image>.img.bmap     block map for sparse writes
+#                            /SHA256SUMS           artifacts with their sha256
+#   latest -> <newest release>                     relative symlink
+#
+# Clients fetch http://10.21.50.12:8080/<release>/<name>.img.gz (or /latest/...)
+# and flash mode derives the sidecar URLs from it by stripping the ".gz".
+#
+# If the mount was not up when the service started, the bind is the bare
+# directory: systemctl --user restart ota-images.service after mounting.
 
 [Unit]
-Description=Serve board OTA images over HTTP (read-only static files)
+Description=Serve board OTA release folders over HTTP (read-only static files)
 Documentation=https://github.com/lulkien/alpine-solovox-z8pro
 
 [Container]
@@ -23,8 +32,8 @@ ContainerName=ota-images
 Image=docker.io/library/python:3.13-alpine
 Exec=python3 -m http.server 8080 --directory /srv/ota --bind 0.0.0.0
 
-# The published images live in the user's home; the container only ever reads.
-Volume=%h/ota-images:/srv/ota:ro
+# The release base is a remote mount; the container only ever reads it.
+Volume=/srv/remotemount/OTA:/srv/ota:ro
 
 # Served on the NAS LAN address (10.21.50.12); rootless needs a high port.
 PublishPort=8080:8080

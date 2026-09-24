@@ -134,9 +134,49 @@ sed -i -e 's|^\techo "/sbin/mdev" > /proc/sys/kernel/hotplug|\t[ -e /proc/sys/ke
 grep -n "hotplug" "$ROOT/etc/init.d/mdev"
 
 echo "--- board tools"
-# ota-flash: pulls a compressed image over HTTP and writes it to the boot
-# medium, then verifies the bootloader magic and a sha256 read-back.
+# ota-flash (OS side) does not write the disk: it arms the next boot into flash
+# mode and reboots. Flash mode is what writes, from RAM, with no rootfs mounted.
 install -m 755 "$WORK/board/ota-flash" "$ROOT/usr/sbin/ota-flash"
+
+echo "--- growfs (fill the card on the first boot after a flash)"
+# flash mode extends the root partition to the end of the card before it
+# reboots; this service grows the filesystem into it once, then reports that
+# there is nothing to do on later boots.
+RESIZE=""; for c in "$ROOT/usr/sbin/resize2fs" "$ROOT/sbin/resize2fs"; do [ -x "$c" ] && RESIZE="$c"; done
+[ -n "$RESIZE" ] || { echo "FAIL: resize2fs missing from the rootfs (needs e2fsprogs-extra)"; exit 1; }
+install -m 755 "$WORK/board/growfs" "$ROOT/etc/init.d/growfs"
+ln -sf /etc/init.d/growfs "$ROOT/etc/runlevels/boot/growfs"
+
+echo "--- mdev hotplug daemon (this kernel has no uevent helper, so nothing"
+echo "    creates /dev nodes or loads modules for hotplugged devices)"
+install -m 755 "$WORK/board/mdev-hotplug" "$ROOT/etc/init.d/mdev-hotplug"
+ln -sf /etc/init.d/mdev-hotplug "$ROOT/etc/runlevels/boot/mdev-hotplug"
+
+echo "--- flash-mode initramfs"
+# Static busybox + the flash init + the bmap writer in a cpio archive. This is
+# what runs when the flash label boots: the target disk is not mounted, so the
+# write cannot collide with a live rootfs.
+IR="$WORK/flash-initramfs"
+rm -rf "$IR"
+mkdir -p "$IR/bin" "$IR/dev" "$IR/tmp" "$IR/proc" "$IR/sys" "$IR/mnt/root"
+[ -x "$ROOT/bin/busybox.static" ] || { echo "FAIL: busybox-static missing from the rootfs"; exit 1; }
+install -m 755 "$ROOT/bin/busybox.static" "$IR/bin/busybox"
+ln -sf busybox "$IR/bin/sh"
+install -m 755 "$WORK/board/flash-init" "$IR/init"
+install -m 755 "$WORK/board/bmap-write.sh" "$IR/bin/bmap-write"
+[ -f "$ROOT/usr/share/udhcpc/default.script" ] || { echo "FAIL: no udhcpc script in the rootfs"; exit 1; }
+install -m 755 "$ROOT/usr/share/udhcpc/default.script" "$IR/udhcpc.script"
+# init's stdio is /dev/console: it has to exist before the kernel execs /init
+mknod -m 600 "$IR/dev/console" c 5 1
+mknod -m 666 "$IR/dev/null" c 1 3
+( cd "$IR" && find . | cpio -o -H newc --quiet | gzip -9 ) > "$ROOT/boot/flash-initramfs.gz" \
+  || { echo "FAIL: cannot build flash-initramfs.gz"; exit 1; }
+ls -lh "$ROOT/boot/flash-initramfs.gz"
+# cpio -t prints names without the leading "./".
+for entry in init bin/busybox bin/bmap-write udhcpc.script; do
+  gzip -dc "$ROOT/boot/flash-initramfs.gz" | cpio -t 2>/dev/null | grep -qx "$entry" ||
+    { echo "FAIL: $entry missing from flash-initramfs.gz"; exit 1; }
+done
 
 echo "--- extlinux.conf"
 cat > "$ROOT/boot/extlinux/extlinux.conf" <<EOF
@@ -145,10 +185,10 @@ DEFAULT bsp
 MENU TITLE Solovox Z8Pro Alpine
 
 # Pick a label by editing DEFAULT (no serial console on this board).
-# `debug` replaces the PARTUUID with an explicit /dev/mmcblk0p1, drops
+# 'debug' replaces the PARTUUID with an explicit /dev/mmcblk0p1, drops
 # rootwait and raises the loglevel, so a missing root panics and reboots
 # instead of waiting silently forever.
-# `console=tty0` is last on purpose: /dev/console goes to the last console=
+# 'console=tty0' is last on purpose: /dev/console goes to the last console=
 # entry, and userspace output (OpenRC, service logs, login) has to appear on
 # HDMI, not on the unattached UART.
 
@@ -176,6 +216,17 @@ LABEL mainline
   INITRD /boot/initramfs-lts
   FDT /boot/dtbs-lts/allwinner/sun50i-h618-transpeed-8k618-t.dtb
   APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 max_loop=128 net.ifnames=0
+
+# Flash mode: RAM-only initramfs that downloads an image and writes it to the
+# disk. ota-flash rewrites this APPEND with ota_* parameters before setting
+# DEFAULT to flash, and restores extlinux.conf.bak if the flash aborts before
+# the first byte is written.
+LABEL flash
+  MENU LABEL Flash mode (downloads and writes an image, no OS running)
+  LINUX /boot/vmlinuz-$KREL
+  FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
+  INITRD /boot/flash-initramfs.gz
+  APPEND rdinit=/init console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7 video=HDMI-A-1:1920x1080@60e panic=30
 EOF
 
 echo "--- resulting /boot"
