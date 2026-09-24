@@ -79,11 +79,76 @@ dd_blocks_written() { # $1 = dd stderr file
 	$aw_cmd '/records out/ { print $1; exit }' "$1" | $sed_cmd 's/+.*//'
 }
 
+# The one above counts full blocks, which is only right while dd reads in small
+# blocks. Given bs=4M on a pipe, busybox dd reports "0+N records out" - the
+# partial count, not bytes - so a complete 4 GiB write looks like zero blocks
+# written and a short stream cannot be told from a good one. For big blocks read
+# the byte count instead: "N bytes ... copied" is the same line shape in busybox
+# and GNU dd. A truncated stream still reports its short byte count, because dd
+# counts what it has copied before the input ends, not full blocks only.
+dd_bytes_copied() { # $1 = dd stderr file
+	$aw_cmd '/copied/ { print $1; exit }' < "$1"
+}
+
 # ------------------------------------------------------------------ full write
 if [ "$FULL" = 1 ]; then
 	say "[write] full write to $TARGET (no bmap)"
-	$dd_cmd of="$TARGET" bs=4M conv=fsync 2>/dev/null || die "stream or write failed" 4
-	say "[write] full write done"
+	# The stream is the whole image, so this is one long dd. This busybox has no
+	# dd status=progress (its dd stops at conv=), so sample what the kernel has
+	# handed to the device instead: /sys/class/block/<dev>/stat field 7 counts
+	# sectors written. Only the sampler is backgrounded and the write stays in
+	# the foreground: an asynchronous command in ash gets /dev/null as its stdin,
+	# so a backgrounded dd would throw the image away and still look like it
+	# succeeded. Sampling also must not steal stdin: awk given a missing file
+	# falls back to reading stdin, so always redirect the file in.
+	dev_stat="/sys/class/block/$(basename "$TARGET")/stat"
+	before=$($aw_cmd '{ print $7 }' < "$dev_stat" 2>/dev/null)
+	# The bmap is only parsed further down, after this branch: a full write knows
+	# the image size only if its bmap was given (flash mode always gives one).
+	# With no size there is no percentage and no short-stream check.
+	IMAGE_SIZE=${IMAGE_SIZE:-}
+	if [ -z "$IMAGE_SIZE" ] && [ -n "$BMAP" ] && [ -r "$BMAP" ]; then
+		IMAGE_SIZE=$($aw_cmd '/<ImageSize>/ { gsub(/<[^>]*>/, " "); print $1; exit }' < "$BMAP")
+	fi
+	case "$IMAGE_SIZE" in ''|*[!0-9]*) IMAGE_SIZE=0 ;; esac
+	(
+		started=$(date +%s)
+		while :; do
+			sleep 5
+			[ "$QUIET" = 0 ] && [ -n "$before" ] && [ "$IMAGE_SIZE" -gt 0 ] || continue
+			now=$($aw_cmd '{ print $7 }' < "$dev_stat" 2>/dev/null)
+			[ -n "$now" ] || continue
+			written=$(( (now - before) * 512 ))
+			[ "$written" -lt 0 ] && written=0
+			pct=$((written * 100 / IMAGE_SIZE))
+			[ "$pct" -gt 99 ] && pct=99
+			waited=$(( $(date +%s) - started ))
+			eta=""
+			[ "$written" -gt 0 ] && [ "$waited" -gt 0 ] &&
+				eta=", $(( (IMAGE_SIZE - written) * waited / written / 60 ))m$(( ((IMAGE_SIZE - written) * waited / written) % 60 ))s left"
+			echo "[write]  $pct%  $((written / 1048576))/$((IMAGE_SIZE / 1048576)) MiB written$eta"
+		done
+	) &
+	progpid=$!
+	start=$(date +%s)
+	full_err=/tmp/bmap-full-dd.err
+	$dd_cmd of="$TARGET" bs=4M conv=fsync 2>"$full_err"
+	rc=$?
+	kill "$progpid" 2>/dev/null
+	wait "$progpid" 2>/dev/null
+	elapsed=$(( $(date +%s) - start ))
+	[ "$rc" = 0 ] || die "write failed (dd exit $rc)" 4
+	if [ "$IMAGE_SIZE" -gt 0 ]; then
+		# dd exits 0 when its input ends early, exactly as in the sparse path:
+		# compare the byte count it reported against the image size.
+		wrote=$(dd_bytes_copied "$full_err")
+		case "$wrote" in ''|*[!0-9]*) wrote=0 ;; esac
+		[ "$wrote" -ge "$IMAGE_SIZE" ] ||
+			die "short stream: dd copied $((wrote / 1048576)) MiB of $((IMAGE_SIZE / 1048576)) MiB" 3
+	else
+		say "[warn] no bmap given: cannot tell a short stream from a complete one"
+	fi
+	say "[write] full write done in ${elapsed}s"
 	[ "$VERIFY" = 0 ] || say "[verify] skipped: full writes are verified with the image sha256"
 	exit 0
 fi

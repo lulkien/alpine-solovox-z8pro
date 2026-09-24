@@ -235,8 +235,29 @@ esac
 if [ "$OTA_MODE" = full ]; then
 	blocks=$(( (OTA_SIZE + 4194304 - 1) / 4194304 ))
 	log "hashing $((OTA_SIZE / 1048576)) MiB read back from the target"
+	# Progress for the read-back: this busybox has no dd status=progress, so
+	# watch the device's own read counter (/sys/class/block/<dev>/stat, field 3,
+	# in 512-byte sectors) instead of leaving the screen frozen for minutes.
+	dev_stat="/sys/class/block/$(basename "$OTA_TARGET")/stat"
+	verify_before=$(awk '{ print $3 }' "$dev_stat" 2>/dev/null)
+	(
+		while :; do
+			sleep 5
+			[ -n "$verify_before" ] || continue
+			now=$(awk '{ print $3 }' "$dev_stat" 2>/dev/null)
+			[ -n "$now" ] || continue
+			read_bytes=$(( (now - verify_before) * 512 ))
+			[ "$read_bytes" -lt 0 ] && read_bytes=0
+			pct=$((read_bytes * 100 / OTA_SIZE))
+			[ "$pct" -gt 99 ] && pct=99
+			echo "[verify]  $pct%  $((read_bytes / 1048576))/$((OTA_SIZE / 1048576)) MiB read back"
+		done
+	) &
+	verify_prog=$!
 	got=$(dd if="$OTA_TARGET" bs=4M count="$blocks" 2>/dev/null | head -c "$OTA_SIZE" |
 		sha256sum | awk '{ print $1 }')
+	kill "$verify_prog" 2>/dev/null
+	wait "$verify_prog" 2>/dev/null
 	if [ "$got" = "$OTA_SHA" ]; then
 		log "sha256 matches the published image"
 	else
