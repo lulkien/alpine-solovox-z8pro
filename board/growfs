@@ -1,0 +1,65 @@
+#!/sbin/openrc-run
+# Grow the root filesystem to fill its partition — once, on the first boot after
+# a flash.
+#
+# The image is built for a fixed size, but the flasher extends the root
+# partition to the end of the card before it reboots. This boot is the one that
+# sees the bigger partition (the kernel reads the table fresh), so this is where
+# the filesystem can be grown into it. Growing a mounted ext4 is supported.
+#
+# Idempotent by comparison rather than by a marker file: when the filesystem
+# already fills its partition this reports so and touches nothing. Doing the
+# same from a running system without a reboot is not possible — the partition
+# table cannot be re-read while the rootfs on it is mounted.
+
+description="Grow the root filesystem to fill the card"
+
+depend() {
+	after root localmount
+	before net
+}
+
+root_device() {
+	# mountinfo: field 3 is major:minor, field 5 is the mount point
+	majmin=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+	[ -n "$majmin" ] || return 1
+	for d in /sys/class/block/*; do
+		[ "$(cat "$d/dev" 2>/dev/null)" = "$majmin" ] || continue
+		echo "/dev/$(basename "$d")"
+		return 0
+	done
+	return 1
+}
+
+start() {
+	dev=$(root_device) || {
+		eend 0 "cannot identify the root device, leaving the filesystem alone"
+		return 0
+	}
+	sectors=$(cat "/sys/class/block/$(basename "$dev")/size" 2>/dev/null)
+	[ -n "$sectors" ] || {
+		eend 0 "no size known for $dev, leaving the filesystem alone"
+		return 0
+	}
+	part_bytes=$((sectors * 512))
+
+	fs_blocks=$(tune2fs -l "$dev" 2>/dev/null | awk '/^Block count:/ { print $3; exit }')
+	fs_bsize=$(tune2fs -l "$dev" 2>/dev/null | awk '/^Block size:/ { print $3; exit }')
+	[ -n "$fs_blocks" ] && [ -n "$fs_bsize" ] || {
+		eend 0 "cannot read the filesystem size on $dev, leaving it alone"
+		return 0
+	}
+	fs_bytes=$((fs_blocks * fs_bsize))
+
+	if [ "$fs_bytes" -ge "$part_bytes" ]; then
+		eend 0 "already filling the partition ($((part_bytes / 1048576)) MiB)"
+		return 0
+	fi
+
+	ebegin "growing $dev from $((fs_bytes / 1048576)) MiB to $((part_bytes / 1048576)) MiB"
+	resize2fs "$dev" || {
+		eend 1 "resize2fs failed on $dev"
+		return 1
+	}
+	eend 0 "root filesystem now fills the card"
+}
