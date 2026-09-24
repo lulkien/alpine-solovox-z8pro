@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 a516de0fe4ba196a445b2234c0cf27c61ad9015c30c74db2c227a7d5dc04f27e
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 47642b12ebc63c341ac8af14a12b768f181c47341e248f8da079e3ba8bb0940c
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -126,6 +126,21 @@ and silently, so nothing is logged.
   `/etc/init.d/mdev` are guarded in the build. Side effect of a missing uevent
   helper: `mdev.conf` rules only run at coldplug, so hotplugged devices get
   their devtmpfs node but no per-owner/mode fixup or `$MODALIAS` autoload.
+
+## Clock (this board has no RTC)
+
+Out of the box the clock sat at Jan 2 1970, and every HTTPS fetch failed —
+`apk` printed `certificate verify failed` followed by a misleading
+`Permission denied`. The image now enables both halves of the fix:
+
+- `swclock` in the boot runlevel: restores the timestamp saved at the last
+  shutdown, so the date is plausible from early boot. It provides `clock`, so it
+  occupies hwclock's slot (the two cannot both be enabled).
+- `ntpd` in the default runlevel (`need net`): busybox NTP client running as
+  user `ntp`, peers from `/etc/conf.d/ntpd` (`pool.ntp.org`,
+  `time.cloudflare.com`).
+
+Check on the board with `date`, `rc-service ntpd status`, `rc-status default`.
 
 ## Packages
 

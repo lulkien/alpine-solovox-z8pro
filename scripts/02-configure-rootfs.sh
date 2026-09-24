@@ -71,10 +71,24 @@ echo "--- enable services"
 for svc in bootmisc devfs dmesg hwdrivers mdev modules root sysctl urandom syslog; do
   [ -x "$ROOT/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "$ROOT/etc/runlevels/boot/$svc"
 done
-for svc in networking dropbear crond local; do
+for svc in networking dropbear crond ntpd local; do
   [ -x "$ROOT/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "$ROOT/etc/runlevels/default/$svc"
 done
 [ -x "$ROOT/etc/init.d/hostname" ] && ln -sf /etc/init.d/hostname "$ROOT/etc/runlevels/boot/hostname"
+
+echo "--- clock (no RTC on this board)"
+# Without this the clock sits at 1970 until someone sets it by hand, and every
+# HTTPS fetch fails with "certificate verify failed" (apk included).
+# swclock: restore the timestamp saved at the last shutdown, so the date is
+# roughly right from early boot; it provides "clock", so it takes hwclock's
+# slot in the boot runlevel.
+# ntpd: busybox NTP client, started from the default runlevel (needs net).
+[ -x "$ROOT/etc/init.d/swclock" ] && ln -sf /etc/init.d/swclock "$ROOT/etc/runlevels/boot/swclock"
+cat > "$ROOT/etc/conf.d/ntpd" <<'EOF'
+# busybox NTP client; started by the ntpd service, which needs networking.
+NTPD_OPTS="-N -p pool.ntp.org -p time.cloudflare.com"
+EOF
+grep -E "^ntp:" "$ROOT/etc/passwd" >/dev/null || echo "WARNING: no ntp user for the ntpd service" >&2
 
 echo "--- BSP kernel files into /boot"
 mkdir -p "$ROOT/boot/dtbs/allwinner/overlay" "$ROOT/boot/extlinux"

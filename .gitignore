@@ -23,3 +23,6 @@ board/x98h.dts
 # Editors
 *.swp
 *~
+
+# Locally built test binaries
+tools/build/
