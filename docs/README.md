@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 65a340d5860bdea0c36e03cca73b95a6b3cd01ff696dfd524273a49c7e7fb039
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 7f9d53b964f00121b4f0bca05996ceb261a32b5ec52573d9d0cd09835fe5dae2
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -164,6 +164,25 @@ interrupted transfer leaves a partially written card that has to be re-flashed
 in a reader. Verify the image boots on a card flashed in a reader before using
 it as an OTA source, and use `--test` to check URL, sidecars and the streaming
 chain in advance.
+
+Two properties are enforced before the first byte is written, because the
+medium being written is the one holding the running system:
+
+- **Tools in RAM.** `wget`, `gzip`, `dd`, `od`, `sha256sum` and the shell
+  reading the script are all busybox. The flasher copies busybox, its musl
+  loader and itself into `/run` (tmpfs) and re-executes from there first;
+  otherwise a page fault mid-write re-reads an executable from a filesystem
+  that was just overwritten.
+- **`/` read-only.** If `/` is still writable when the write starts, ext4
+  writeback puts dirty metadata inside the freshly written image. The remount is
+  attempted with the root partition explicitly and then without a source, and
+  the flags are re-read afterwards; a failed remount aborts the flash with exit
+  6 instead of warning and continuing.
+
+Both are guards, not guarantees: the target medium still holds the running
+kernel's view of the world until the reboot. The alternative that removes the
+hazard entirely is an A/B layout (two rootfs partitions plus a switchable
+extlinux label), which this image does not have.
 
 ## Clock (this board has no RTC)
 

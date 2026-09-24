@@ -5,51 +5,89 @@
 # later), then verifies what actually landed: the u-boot magic at KiB 8 and a
 # sha256 read-back of the written region against the published hash.
 #
-# Nothing is downloaded to disk first: the target medium holds the running
-# rootfs, so a local copy would be overwritten by the write it feeds.
+# The write targets the medium the running system lives on, so two things are
+# mandatory and enforced here:
 #
-# Publish the artifacts from the build host with scripts/04-ota-serve.sh:
-#   image/alpine-solovox-z8pro-<ver>.img.gz          the transfer artifact
-#   image/alpine-solovox-z8pro-<ver>.img.sha256      sha256 of the raw image
-#   image/alpine-solovox-z8pro-<ver>.img.size        size of the raw image
+#   1. Tools in RAM. wget, gzip, dd, od, sha256sum and the shell reading this
+#      script are all busybox. busybox and its musl loader are copied into /run
+#      (tmpfs) and re-executed from there before anything touches the disk;
+#      otherwise a page fault mid-write re-reads an executable from a
+#      filesystem that was just overwritten.
+#   2. / read-only. If / is still writable when the write begins, ext4 writeback
+#      puts dirty metadata inside the freshly written image. The flasher refuses
+#      to write unless the remount actually succeeded.
+#
+# Nothing is staged on the target medium: the image streams straight from the
+# network to dd, because a local copy would be overwritten by the very write it
+# feeds.
+#
+# Publish the artifacts from the build host with scripts/04-ota-publish.sh:
+#   <name>.img.gz       the transfer artifact
+#   <name>.img.sha256   sha256 of the raw image
+#   <name>.img.size     size of the raw image in bytes
 #
 # Usage:
-#   ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [-r] [--test]
-#     -t <device>  target whole disk (default: the disk holding /)
-#     -y           skip the confirmation prompt (still refuses unsafe targets)
-#     -n           skip the read-back verification (much faster, less safe)
-#     -r           reboot without asking once the write succeeded
-#     --test       dry run: stream the image to /dev/null, write nothing.
+#   ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [--no-reboot] [--test]
+#     -t <device>   target whole disk (default: the disk holding /)
+#     -y            skip the confirmation prompt (still refuses unsafe targets)
+#     -n            skip the read-back verification (much faster, less safe)
+#     --no-reboot   do not reboot after a successful write
+#     --test        dry run: stream the image to /dev/null, write nothing
 #
 # Exit codes: 1 usage/root, 2 target problem, 3 source not reachable,
-#             4 checksum mismatch, 5 write failed, 0 success.
+#             4 checksum mismatch, 5 write failed, 6 preparation failed, 0 ok.
 
 set -u
 
 MB=1048576
 UBOOT_MAGIC="16 00 00 ea 65 47 4f 4e"
+RUNDIR=/run/ota-flash
+BUSYBOX="$RUNDIR/bin/busybox"
 
 die() { echo "[error] $*" >&2; exit "$2"; }
 
 usage() {
 	cat >&2 <<'EOF'
-usage: ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [-r] [--test]
-  -t <device>  target whole disk (default: the disk holding /)
-  -y           do not ask for confirmation
-  -n           skip read-back verification
-  -r           reboot without asking after success
-  --test       dry run: stream the image to /dev/null, write nothing
+usage: ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [--no-reboot] [--test]
+  -t <device>   target whole disk (default: the disk holding /)
+  -y            do not ask for confirmation
+  -n            skip read-back verification
+  --no-reboot   do not reboot after a successful write
+  --test        dry run: stream the image to /dev/null, write nothing
 EOF
 	exit 1
 }
 
 [ "$(id -u)" = 0 ] || die "must run as root" 1
 
+# ------------------------------------------------------------- tools into RAM
+if [ "${OTA_FLASH_STAGED:-0}" != "1" ]; then
+	case "$(mount | awk '$3 == "/run" { print $5 }')" in
+	tmpfs) ;;
+	*) echo "[warn] /run is not tmpfs: tools may be reloaded from the disk being written" >&2 ;;
+	esac
+	mkdir -p "$RUNDIR/bin" "$RUNDIR/lib" || die "cannot create $RUNDIR (no writable RAM)" 6
+	cp -f /bin/busybox "$RUNDIR/bin/busybox" || die "cannot stage busybox in RAM" 6
+	# musl's loader is the libc on Alpine: take every file it may open
+	for f in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
+		[ -e "$f" ] && cp -f "$f" "$RUNDIR/lib/" 2>/dev/null
+	done
+	cp -f "$0" "$RUNDIR/ota-flash" || die "cannot stage this script in RAM" 6
+	chmod 755 "$RUNDIR/ota-flash" "$RUNDIR/bin/busybox"
+	LOADER=$(ls "$RUNDIR"/lib/ld-musl-*.so.1 2>/dev/null | head -1)
+	[ -n "$LOADER" ] || die "no musl loader staged in $RUNDIR/lib" 6
+	echo "[prep] tools staged in $RUNDIR (tmpfs); re-executing from RAM"
+	OTA_FLASH_STAGED=1 exec "$LOADER" --library-path "$RUNDIR/lib" \
+		"$BUSYBOX" sh "$RUNDIR/ota-flash" "$@"
+fi
+
+
+
 URL=""
 TARGET=""
 ASSUME_YES=0
 VERIFY=1
-AUTO_REBOOT=0
+NO_REBOOT=0
 TEST=0
 
 while [ $# -gt 0 ]; do
@@ -57,7 +95,8 @@ while [ $# -gt 0 ]; do
 	-t) [ $# -ge 2 ] || usage; TARGET="$2"; shift 2 ;;
 	-y) ASSUME_YES=1; shift ;;
 	-n) VERIFY=0; shift ;;
-	-r) AUTO_REBOOT=1; shift ;;
+	-r) shift ;;                 # rebooting after success is the default now
+	--no-reboot) NO_REBOOT=1; shift ;;
 	--test) TEST=1; shift ;;
 	-h|--help) usage ;;
 	-*) usage ;;
@@ -71,35 +110,39 @@ http://*|https://*) ;;
 *) die "only http:// and https:// URLs are supported (got '$URL')" 1 ;;
 esac
 
-for tool in wget gzip dd sha256sum od awk sed wc; do
-	command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool" 1
+for tool in wget gzip dd sha256sum od awk sed wc head grep; do
+	"$BUSYBOX" --list 2>/dev/null | "$BUSYBOX" grep -qx "$tool" ||
+		die "staged busybox lacks the $tool applet" 6
 done
 
 # ---------------------------------------------------------------- target disk
 whole_disk_of() { # $1 = partition or disk node name -> whole disk node name
 	case "$1" in
 	*nvme*|*mmcblk*) case "$1" in *p[0-9]*) printf '%s' "${1%p[0-9]*}" ;; *) printf '%s' "${1%[0-9]}" ;; esac ;;
-	*sd[a-z]) printf '%s' "$1" ;;
 	*) printf '%s' "$1" ;;
 	esac
 }
 
-root_disk() {
-	majmin=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+ROOT_PART=""
+ROOT_WHOLE=""
+root_block() { # sets ROOT_PART (e.g. mmcblk2p1) and ROOT_WHOLE (e.g. mmcblk2)
+	majmin=$("$BUSYBOX" awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
 	[ -n "$majmin" ] || return 1
-	link=$(readlink -f "/sys/dev/block/$majmin") || return 1
-	whole_disk_of "$(basename "$link")"
+	link=$("$BUSYBOX" readlink -f "/sys/dev/block/$majmin") || return 1
+	ROOT_PART=$("$BUSYBOX" basename "$link")
+	ROOT_WHOLE=$(whole_disk_of "$ROOT_PART")
 }
+
+root_block || true
 
 if [ "$TEST" = 1 ]; then
 	TARGET=/dev/null
 elif [ -z "$TARGET" ]; then
-	disk=$(root_disk) || die "cannot determine the disk holding /" 2
-	TARGET="/dev/$disk"
+	[ -n "$ROOT_WHOLE" ] || die "cannot determine the disk holding /" 2
+	TARGET="/dev/$ROOT_WHOLE"
 else
 	[ -b "$TARGET" ] || die "$TARGET is not a block device" 2
-	# reject a partition: the image carries its own partition table
-	base=$(basename "$TARGET")
+	base=$("$BUSYBOX" basename "$TARGET")
 	whole=$(whole_disk_of "$base")
 	[ "$whole" = "$base" ] || die "$TARGET is a partition; pass the whole disk (/$whole)" 2
 fi
@@ -109,13 +152,11 @@ if [ "$TEST" = 1 ]; then
 	SAME_AS_ROOT=0
 else
 	[ -b "$TARGET" ] || die "$TARGET is not a block device" 2
-	DEVNAME=$(basename "$TARGET")
-	SIZE_SECTORS=$(cat "/sys/class/block/$DEVNAME/size" 2>/dev/null) || die "no sysfs entry for $DEVNAME" 2
+	DEVNAME=$("$BUSYBOX" basename "$TARGET")
+	SIZE_SECTORS=$("$BUSYBOX" cat "/sys/class/block/$DEVNAME/size" 2>/dev/null) || die "no sysfs entry for $DEVNAME" 2
 	TARGET_SIZE=$((SIZE_SECTORS * 512))
-
-	ROOT_DISK_NODE=$(root_disk || echo "")
 	case "$TARGET" in
-	/dev/"$ROOT_DISK_NODE") SAME_AS_ROOT=1 ;;
+	/dev/"$ROOT_WHOLE") SAME_AS_ROOT=1 ;;
 	*) SAME_AS_ROOT=0 ;;
 	esac
 fi
@@ -130,25 +171,22 @@ echo "[source]"
 echo "  url        : $URL"
 echo "  sha256     : $SIDE_SHA"
 echo "  size       : $SIDE_SIZE"
-
 echo "[target]"
 echo "  device     : $TARGET"
 echo "  size       : $TARGET_SIZE bytes ($((TARGET_SIZE / MB)) MiB)"
-if [ "$SAME_AS_ROOT" = 1 ]; then
-	echo "  note       : this disk carries the running system"
-fi
+[ "$SAME_AS_ROOT" = 1 ] && echo "  note       : this disk carries the running system"
 
-wget -q -T 15 --spider "$URL" || die "source not reachable: $URL" 3
+"$BUSYBOX" wget -q -T 15 --spider "$URL" || die "source not reachable: $URL" 3
 
 EXPECT_SIZE=""
 EXPECT_HASH=""
-if wget -q -T 15 -O - "$SIDE_SHA" > /tmp/.ota.sha 2>/dev/null && [ -s /tmp/.ota.sha ]; then
-	EXPECT_HASH=$(awk '{ print $1; exit }' /tmp/.ota.sha)
+if "$BUSYBOX" wget -q -T 15 -O - "$SIDE_SHA" > "$RUNDIR/.sha" 2>/dev/null && [ -s "$RUNDIR/.sha" ]; then
+	EXPECT_HASH=$("$BUSYBOX" awk '{ print $1; exit }' "$RUNDIR/.sha")
 fi
-if wget -q -T 15 -O - "$SIDE_SIZE" > /tmp/.ota.size 2>/dev/null && [ -s /tmp/.ota.size ]; then
-	EXPECT_SIZE=$(awk '{ print $1; exit }' /tmp/.ota.size)
+if "$BUSYBOX" wget -q -T 15 -O - "$SIDE_SIZE" > "$RUNDIR/.size" 2>/dev/null && [ -s "$RUNDIR/.size" ]; then
+	EXPECT_SIZE=$("$BUSYBOX" awk '{ print $1; exit }' "$RUNDIR/.size")
 fi
-rm -f /tmp/.ota.sha /tmp/.ota.size
+rm -f "$RUNDIR/.sha" "$RUNDIR/.size"
 
 if [ -z "$EXPECT_HASH" ] && [ "$VERIFY" = 1 ]; then
 	die "no usable $SIDE_SHA: cannot verify the image (use -n to skip verification)" 3
@@ -162,10 +200,10 @@ fi
 if [ "$TEST" = 0 ]; then
 	echo
 	echo "Every byte on $TARGET will be replaced: partition table, bootloader,"
-	echo "rootfs. The old Armbian/Alpine install on it is gone afterwards."
+	echo "rootfs. The old install on it is gone afterwards."
 	if [ "$SAME_AS_ROOT" = 1 ]; then
-		echo "This is the disk you booted from. If the transfer breaks half way you"
-		echo "will have to re-flash that card in a reader."
+		echo "This is the disk you booted from: if the transfer breaks half way"
+		echo "you will have to re-flash that card in a reader."
 	fi
 	echo
 fi
@@ -176,21 +214,31 @@ if [ "$TEST" = 0 ] && [ "$ASSUME_YES" = 0 ]; then
 	[ "$answer" = "$TARGET" ] || die "aborted by user" 2
 fi
 
-# Writes to the old filesystem would land in the new image; stop them first.
+# --------------------------------------------------------- prepare the system
 if [ "$TEST" = 0 ]; then
-	sync
-	if ! mount -o remount,ro / 2>/dev/null; then
-		echo "[warn] could not remount / read-only: keep the system idle until reboot"
+	echo "[prep] syncing"
+	"$BUSYBOX" sync
+	echo "[prep] remounting / read-only"
+	if ! "$BUSYBOX" mount -o remount,ro "/dev/$ROOT_PART" / 2>/dev/null &&
+	   ! "$BUSYBOX" mount -o remount,ro / 2>/dev/null; then
+		die "could not remount / read-only: refusing to write, since ext4
+       writeback from a live / would land inside the new image" 6
 	fi
+	if "$BUSYBOX" mount | "$BUSYBOX" grep " on / type" | "$BUSYBOX" grep -qv "(ro,"; then
+		die "the remount reported success but / is still writable" 6
+	fi
+	echo "[prep] / is read-only"
+	[ -w /proc/sys/vm/drop_caches ] && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
 fi
 
-start=$(date +%s)
+# ------------------------------------------------------------------ write
+start=$("$BUSYBOX" date +%s)
 
 if [ "$TEST" = 1 ]; then
 	echo "[test] streaming $URL through gzip, writing nothing"
-	got=$(wget -q -T 20 -O - "$URL" | gzip -dc | wc -c)
+	got=$("$BUSYBOX" wget -q -T 20 -O - "$URL" | "$BUSYBOX" gzip -dc | "$BUSYBOX" wc -c)
 	status=$?
-	elapsed=$(( $(date +%s) - start ))
+	elapsed=$(( $("$BUSYBOX" date +%s) - start ))
 	[ "$status" = 0 ] || die "stream failed (wget/gzip exit $status)" 5
 	echo "[test] decompressed $got bytes in ${elapsed}s"
 	if [ -n "$EXPECT_SIZE" ]; then
@@ -204,18 +252,19 @@ if [ "$TEST" = 1 ]; then
 fi
 
 echo "[write] streaming $URL -> $TARGET"
-if ! wget -q -T 30 -O - "$URL" | gzip -dc | dd of="$TARGET" bs=4M conv=fsync 2>/dev/null; then
-	echo "[error] write failed; the target may hold a partial image and need a"
+if ! "$BUSYBOX" wget -q -T 30 -O - "$URL" | "$BUSYBOX" gzip -dc |
+     "$BUSYBOX" dd of="$TARGET" bs=4M conv=fsync 2>/dev/null; then
+	echo "[error] write failed; the target may hold a partial image and need a" >&2
 	echo "        re-flash from a card reader on another machine" >&2
 	echo "        (a truncated stream is only detected by the read-back below)" >&2
 	exit 5
 fi
-sync
-echo "[write] done in $(( $(date +%s) - start ))s"
+"$BUSYBOX" sync
+echo "[write] done in $(( $("$BUSYBOX" date +%s) - start ))s"
 
 # ------------------------------------------------------------------ verify
-
-magic=$(dd if="$TARGET" bs=1 skip=8192 count=8 2>/dev/null | od -A n -t x1 | sed 's/^ *//; s/  */ /g; s/ *$//')
+magic=$("$BUSYBOX" dd if="$TARGET" bs=1 skip=8192 count=8 2>/dev/null | "$BUSYBOX" od -A n -t x1 |
+	"$BUSYBOX" sed 's/^ *//; s/  */ /g; s/ *$//')
 echo "[verify] u-boot magic at KiB 8: $magic"
 case "$magic" in
 "$UBOOT_MAGIC"*) echo "[verify] bootloader present" ;;
@@ -226,8 +275,8 @@ if [ "$VERIFY" = 1 ]; then
 	size=${EXPECT_SIZE:-$TARGET_SIZE}
 	blocks=$(( (size + 4 * MB - 1) / (4 * MB) ))
 	echo "[verify] hashing $((size / MB)) MiB read back from $TARGET"
-	got=$(dd if="$TARGET" bs=4M count="$blocks" 2>/dev/null | head -c "$size" \
-		| sha256sum | awk '{ print $1 }')
+	got=$("$BUSYBOX" dd if="$TARGET" bs=4M count="$blocks" 2>/dev/null | "$BUSYBOX" head -c "$size" |
+		"$BUSYBOX" sha256sum | "$BUSYBOX" awk '{ print $1 }')
 	if [ "$got" = "$EXPECT_HASH" ]; then
 		echo "[verify] sha256 matches"
 	else
@@ -239,15 +288,12 @@ if [ "$VERIFY" = 1 ]; then
 	fi
 fi
 
-sync
-echo "[done] image written and verified; the running system is stale now"
+"$BUSYBOX" sync
+echo "[done] image written and verified"
 
-if [ "$AUTO_REBOOT" = 1 ]; then
-	reboot -f
+if [ "$NO_REBOOT" = 1 ]; then
+	echo "[done] / no longer matches the disk: reboot manually"
+	exit 0
 fi
-printf 'Reboot now to boot the new image? (y/N): '
-read -r answer
-case "$answer" in
-y|Y) reboot -f ;;
-*) echo "Reboot as soon as possible: / is read-only and does not match the disk." ;;
-esac
+echo "[done] rebooting into the new image"
+"$BUSYBOX" reboot -f
