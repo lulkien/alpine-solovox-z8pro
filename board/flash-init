@@ -1,0 +1,283 @@
+#!/bin/busybox sh
+# flash-init: /init of the flash initramfs.
+#
+# Runs from RAM only. No filesystem is mounted from the SD card while this script
+# writes to the SD card, which is the whole point: the write cannot collide with a
+# live rootfs, and no executable or script this runs is read back from the medium
+# being overwritten.
+#
+# The OS-side ota-flash arms this by baking parameters into the `flash` extlinux
+# label and rebooting into it:
+#
+#   ota_url=http://host/alpine-<board>-<ver>.img.gz   image to stream
+#   ota_sha256=<hex>       expected sha256 of the raw image
+#   ota_size=<bytes>       expected raw image size
+#   ota_bmap=http://host/…img.bmap                    block map for sparse writes
+#   ota_target=/dev/mmcblk2                           whole disk to write
+#   ota_rootpart=/dev/mmcblk2p1                       partition holding /boot
+#   ota_mode=bmap|full                                sparse by default
+#   ota_timeout=<seconds>                             read timeout for the image stream
+#   ota_fill=0|1                                      extend the root partition to
+#                                                    fill the card (default 1)
+#
+# Sequence: parameters -> DHCP -> bmap -> write -> verify -> reboot.
+# Before the first byte is written, any failure restores the saved extlinux.conf
+# and reboots into the untouched OS. After that there is no way back: a failure
+# leaves a partly written disk that must be re-flashed in a card reader.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+BUSYBOX=/bin/busybox
+TMP=/tmp
+
+log() { echo "flash> $*"; }
+warn() { echo "flash> $*" >&2; }
+
+# Every helper is a busybox applet from the initramfs; --install links them all.
+[ -x "$BUSYBOX" ] || { echo "flash> no busybox in the initramfs" >&2; exec sh; }
+$BUSYBOX --install -s /bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p "$TMP"
+mount -t tmpfs tmpfs "$TMP"
+
+cmdline_value() { # $1 = key; matches the first token too, not just SP-separated
+	tr ' ' '\n' < /proc/cmdline | sed -n "s/^$1=//p" | head -1
+}
+
+OTA_URL=$(cmdline_value ota_url)
+OTA_SHA=$(cmdline_value ota_sha256)
+OTA_SIZE=$(cmdline_value ota_size)
+OTA_BMAP=$(cmdline_value ota_bmap)
+OTA_TARGET=$(cmdline_value ota_target)
+OTA_ROOTPART=$(cmdline_value ota_rootpart)
+OTA_MODE=$(cmdline_value ota_mode)
+OTA_HOSTNAME=$(cmdline_value ota_hostname)
+OTA_TIMEOUT=$(cmdline_value ota_timeout)
+# The stream can be quiet for a while on a slow or heavily emulated link without
+# being dead, so it gets a much longer read timeout than the small metadata
+# fetches. Short here means "abort and keep the installed system".
+[ -n "${OTA_TIMEOUT:-}" ] || OTA_TIMEOUT=120
+
+# ------------------------------------------------------------- recovery paths
+restore_and_reboot() { # $1 = reason
+	warn "$1"
+	if [ -n "$OTA_ROOTPART" ] && [ -b "$OTA_ROOTPART" ]; then
+		log "restoring the boot configuration and going back to the installed OS"
+		if mkdir -p /mnt/root && mount -t ext4 "$OTA_ROOTPART" /mnt/root 2>/dev/null; then
+			if [ -f /mnt/root/boot/extlinux/extlinux.conf.bak ]; then
+				cp /mnt/root/boot/extlinux/extlinux.conf.bak \
+					/mnt/root/boot/extlinux/extlinux.conf &&
+					log "extlinux.conf restored from extlinux.conf.bak"
+			else
+				warn "no extlinux.conf.bak on $OTA_ROOTPART: nothing restored"
+			fi
+			sync
+			umount /mnt/root
+		else
+			warn "cannot mount $OTA_ROOTPART read-write: nothing restored"
+		fi
+	fi
+	log "rebooting; the installed system is unchanged"
+	sync
+	reboot -f
+	while true; do sleep 3600; done
+}
+
+read_mbr_entry() { # $1 = slot 0..3 -> "type start_sector sector_count"
+	dd if="$OTA_TARGET" bs=1 skip=$((446 + 16 * $1)) count=16 2>/dev/null |
+		od -An -v -tu1 |
+		awk '{ printf "%d %d %d\n", $5, $9 + $10 * 256 + $11 * 65536 + $12 * 16777216, \
+			$13 + $14 * 256 + $15 * 65536 + $16 * 16777216 }'
+}
+
+write_le32() { # $1 = value, $2 = byte offset on the target
+	printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+		$(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )))" |
+		dd of="$OTA_TARGET" bs=1 seek="$2" conv=notrunc 2>/dev/null
+}
+
+give_up() { # $1 = reason; the disk has been touched, nothing can recover it here
+	warn "$1"
+	echo
+	echo "flash> ==================================================================="
+	echo "flash> THE DISK HAS BEEN PARTLY WRITTEN."
+	echo "flash> This machine cannot recover itself: the image being written was"
+	echo "flash> the one it boots. Take the card out and flash it in a reader."
+	echo "flash> ==================================================================="
+	echo
+	sync
+	while true; do sleep 3600; done
+}
+
+# ------------------------------------------------------------- sanity checks
+[ -n "$OTA_URL" ] || restore_and_reboot "no ota_url on the kernel command line"
+[ -n "$OTA_TARGET" ] || restore_and_reboot "no ota_target on the kernel command line"
+[ -b "$OTA_TARGET" ] || restore_and_reboot "$OTA_TARGET is not a block device"
+[ -n "$OTA_SHA" ] || restore_and_reboot "no ota_sha256: refusing to write unverified"
+[ -n "$OTA_SIZE" ] || restore_and_reboot "no ota_size: refusing to write"
+case "$OTA_SIZE" in *[!0-9]*) restore_and_reboot "ota_size is not a number: $OTA_SIZE" ;; esac
+[ -n "$OTA_MODE" ] || OTA_MODE=bmap
+
+TARGET_BYTES=$(cat "/sys/class/block/$(basename "$OTA_TARGET")/size" 2>/dev/null)
+case "$TARGET_BYTES" in
+''|*[!0-9]*) restore_and_reboot "no sysfs size for $OTA_TARGET" ;;
+esac
+TARGET_BYTES=$((TARGET_BYTES * 512))
+[ "$TARGET_BYTES" -ge "$OTA_SIZE" ] ||
+	restore_and_reboot "$OTA_TARGET holds $TARGET_BYTES bytes, image needs $OTA_SIZE"
+
+echo
+echo "flash> Alpine flash mode"
+echo "flash>   image    : $OTA_URL"
+echo "flash>   sha256   : $OTA_SHA"
+echo "flash>   size     : $OTA_SIZE bytes"
+echo "flash>   mode     : $OTA_MODE"
+echo "flash>   bmap     : ${OTA_BMAP:-none}"
+echo "flash>   target   : $OTA_TARGET ($((TARGET_BYTES / 1048576)) MiB)"
+echo "flash>   rootpart : ${OTA_ROOTPART:-unknown}"
+echo "flash>   note     : this disk is the one that booted; the OS is not running"
+echo
+
+# --------------------------------------------------------------- networking
+log "bringing up the wired interface"
+if [ -n "$OTA_HOSTNAME" ]; then
+	hostname "$OTA_HOSTNAME" 2>/dev/null
+fi
+ip link set eth0 up 2>/dev/null || restore_and_reboot "no eth0 in flash mode"
+got_ip=0
+for attempt in 1 2 3; do
+	log "dhcp attempt $attempt"
+	if udhcpc -i eth0 -n -q -t 8 -T 3 -s /udhcpc.script >/dev/null 2>&1; then
+		got_ip=1
+		break
+	fi
+	sleep 2
+done
+[ "$got_ip" = 1 ] || restore_and_reboot "no DHCP lease on eth0"
+IP=$(ip -4 -o addr show dev eth0 | awk '{ print $4 }' | head -1)
+[ -n "$IP" ] || restore_and_reboot "eth0 has no IPv4 address after DHCP"
+log "eth0 is up: $IP"
+
+wget_or() { # $1 = url, $2 = output file ("-" for stdout)
+	wget -q -T 30 -O "$2" "$1" 2>/dev/null
+}
+
+log "checking the published metadata"
+SIDE_SHA="${OTA_URL%.gz}.sha256"
+SIDE_SIZE="${OTA_URL%.gz}.size"
+wget_or "$SIDE_SHA" "$TMP/url.sha256" || restore_and_reboot "cannot fetch $SIDE_SHA"
+wget_or "$SIDE_SIZE" "$TMP/url.size" || restore_and_reboot "cannot fetch $SIDE_SIZE"
+PUB_SHA=$(awk '{ print $1; exit }' "$TMP/url.sha256")
+PUB_SIZE=$(awk '{ print $1; exit }' "$TMP/url.size")
+[ "$PUB_SHA" = "$OTA_SHA" ] ||
+	restore_and_reboot "published sha256 ($PUB_SHA) is not what was armed ($OTA_SHA)"
+[ "$PUB_SIZE" = "$OTA_SIZE" ] ||
+	restore_and_reboot "published size ($PUB_SIZE) is not what was armed ($OTA_SIZE)"
+log "metadata matches what was armed"
+
+# ------------------------------------------------------------------- the bmap
+if [ "$OTA_MODE" = bmap ]; then
+	[ -n "$OTA_BMAP" ] || restore_and_reboot "ota_mode=bmap but no ota_bmap"
+	log "fetching the block map"
+	wget_or "$OTA_BMAP" "$TMP/image.bmap" || restore_and_reboot "cannot fetch $OTA_BMAP"
+	BMAP_SIZE=$(awk '/<ImageSize>/ { gsub(/<[^>]*>/, " "); print $1; exit }' "$TMP/image.bmap")
+	[ "$BMAP_SIZE" = "$OTA_SIZE" ] ||
+		restore_and_reboot "bmap describes $BMAP_SIZE bytes, image is $OTA_SIZE"
+	BMAP_RANGES=$(grep -c '<Range' "$TMP/image.bmap")
+	[ "$BMAP_RANGES" -gt 0 ] || restore_and_reboot "bmap has no ranges"
+	log "bmap ok: $BMAP_RANGES ranges"
+fi
+
+echo
+echo "flash> ==================================================================="
+echo "flash> Writing $OTA_TARGET now. From this point on there is NO way back:"
+echo "flash> a failure or a power cut needs a card reader and a fresh flash."
+echo "flash> ==================================================================="
+echo
+sleep 10
+
+# A sparse write never touches the blocks between ranges and the image is zero
+# there, so those blocks must already be zero on the target. Failing this check
+# is a failure before the first byte: the installed system is still intact, and
+# re-arming with --full writes every byte instead.
+if [ "$OTA_MODE" = bmap ]; then
+	log "checking that the target is zero where the image is"
+	bmap-write --check-gaps -b "$TMP/image.bmap" -t "$OTA_TARGET" ||
+		restore_and_reboot "the target is not zero where the image is: re-arm with --full to write every byte"
+fi
+
+start=$(date +%s)
+if [ "$OTA_MODE" = full ]; then
+	log "streaming the whole image (mode=full, read timeout ${OTA_TIMEOUT}s)"
+	wget -q -T "$OTA_TIMEOUT" -O - "$OTA_URL" | gzip -dc |
+		bmap-write --full -t "$OTA_TARGET" || give_up "write failed"
+else
+	log "streaming the image, writing mapped blocks only (mode=bmap, read timeout ${OTA_TIMEOUT}s)"
+	wget -q -T "$OTA_TIMEOUT" -O - "$OTA_URL" | gzip -dc |
+		bmap-write -b "$TMP/image.bmap" -t "$OTA_TARGET" || give_up "write failed"
+fi
+elapsed=$(( $(date +%s) - start ))
+log "write finished in ${elapsed}s"
+
+# ------------------------------------------------------------------ verification
+magic=$(dd if="$OTA_TARGET" bs=1 skip=8192 count=8 2>/dev/null | od -A n -t x1 |
+	sed 's/^ *//; s/  */ /g; s/ *$//')
+log "u-boot magic at KiB 8: $magic"
+case "$magic" in
+"16 00 00 ea 65 47 4f 4e"*) : ;;
+*) give_up "bootloader magic missing after the write" ;;
+esac
+
+if [ "$OTA_MODE" = full ]; then
+	blocks=$(( (OTA_SIZE + 4194304 - 1) / 4194304 ))
+	log "hashing $((OTA_SIZE / 1048576)) MiB read back from the target"
+	got=$(dd if="$OTA_TARGET" bs=4M count="$blocks" 2>/dev/null | head -c "$OTA_SIZE" |
+		sha256sum | awk '{ print $1 }')
+	if [ "$got" = "$OTA_SHA" ]; then
+		log "sha256 matches the published image"
+	else
+		give_up "sha256 mismatch: expected $OTA_SHA, got $got"
+	fi
+else
+	log "range checksums were verified during the write (bmap)"
+fi
+
+# ------------------------------------------------- and the rest of the card
+# The image's partition is image-sized, so a bigger card keeps its extra space
+# unusable. Extend the partition here, before the reboot: the kernel reads the
+# table fresh on the next boot, and the OS then grows the filesystem to match
+# (its growfs service, once). Doing it from the running OS is not possible, the
+# table cannot be re-read while the rootfs on it is mounted.
+if [ "${OTA_FILL:-1}" = 1 ] && [ "$TARGET_BYTES" -gt "$OTA_SIZE" ]; then
+	read -r ptyp pstart pcount <<EOF
+$(read_mbr_entry 0)
+EOF
+	if [ "${ptyp:-0}" = 131 ] && [ "${pstart:-0}" -ge 2048 ]; then
+		new_count=$(( TARGET_BYTES / 512 - pstart ))
+		if [ "$new_count" -gt "${pcount:-0}" ]; then
+			write_le32 "$new_count" 458
+			sync
+			got=$(dd if="$OTA_TARGET" bs=1 skip=458 count=4 2>/dev/null | od -An -v -tu1 |
+				awk '{ print $1 + $2 * 256 + $3 * 65536 + $4 * 16777216 }')
+			[ "$got" = "$new_count" ] ||
+				give_up "cannot extend the root partition (wrote $got, wanted $new_count)"
+			log "root partition extended to $(($((pstart + new_count)) * 512 / 1048576)) MiB; the OS grows the filesystem on first boot"
+		else
+			log "the root partition already spans the card"
+		fi
+	else
+		log "not touching the partition table (no primary 0x83 partition)"
+	fi
+fi
+
+sync
+echo
+log "image written and verified"
+log "rebooting into it; the new image boots the OS (its extlinux default is bsp)"
+echo
+reboot -f
+while true; do sleep 3600; done

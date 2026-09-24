@@ -1,121 +1,78 @@
 #!/bin/sh
-# ota-flash: flash this board from a gzip-compressed image served over HTTP.
+# ota-flash: arm the next boot into flash mode, then reboot into it.
 #
-# Streams  <url>  through gzip into dd on the boot medium (SD card now, eMMC
-# later), then verifies what actually landed: the u-boot magic at KiB 8 and a
-# sha256 read-back of the written region against the published hash.
+# This script does NOT write the boot medium. Writing the medium that holds the
+# running rootfs is what killed the earlier attempt: live ext4 writeback landed
+# inside the image being written, and the flasher's own executables were read back
+# from the very blocks dd was overwriting.
 #
-# The write targets the medium the running system lives on, so two things are
-# mandatory and enforced here:
+# Instead it prepares the `flash` extlinux label with the image URL and its
+# metadata, saves the current boot configuration, sets DEFAULT flash and reboots.
+# The next boot runs an initramfs (RAM only, no rootfs mounted) that downloads the
+# image and writes it, so nothing on the disk is in use while it is written.
 #
-#   1. Tools in RAM. wget, gzip, dd, od, sha256sum and the shell reading this
-#      script are all busybox. busybox and its musl loader are copied into /run
-#      (tmpfs) and re-executed from there before anything touches the disk;
-#      otherwise a page fault mid-write re-reads an executable from a
-#      filesystem that was just overwritten.
-#   2. / read-only. If / is still writable when the write begins, ext4 writeback
-#      puts dirty metadata inside the freshly written image. The flasher refuses
-#      to write unless the remount actually succeeded.
-#
-# Nothing is staged on the target medium: the image streams straight from the
-# network to dd, because a local copy would be overwritten by the very write it
-# feeds.
-#
-# Publish the artifacts from the build host with scripts/04-ota-publish.sh:
-#   <name>.img.gz       the transfer artifact
-#   <name>.img.sha256   sha256 of the raw image
-#   <name>.img.size     size of the raw image in bytes
+# Before the first byte is written, any failure inside flash mode restores
+# extlinux.conf from extlinux.conf.bak and reboots into the untouched OS. After
+# that point a failure leaves a partly written disk: only a card reader and a
+# fresh flash can recover it.
 #
 # Usage:
-#   ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [--no-reboot] [--test]
-#     -t <device>   target whole disk (default: the disk holding /)
-#     -y            skip the confirmation prompt (still refuses unsafe targets)
-#     -n            skip the read-back verification (much faster, less safe)
-#     --no-reboot   do not reboot after a successful write
-#     --test        dry run: stream the image to /dev/null, write nothing
+#   ota-flash <url.img.gz> [-y] [--full] [--no-reboot] [--test]
+#   ota-flash --status          show the armed parameters and the boot default
+#   ota-flash --cancel          restore extlinux.conf and drop the arming
 #
-# Exit codes: 1 usage/root, 2 target problem, 3 source not reachable,
-#             4 checksum mismatch, 5 write failed, 6 preparation failed, 0 ok.
+#   -y            skip the confirmation prompt
+#   --full        write every byte of the image instead of the mapped blocks
+#   --no-reboot   arm, but do not reboot
+#   --test        fetch and check the metadata, change nothing
+#
+# Exit: 1 usage/root, 2 boot configuration problem, 3 source not reachable,
+#       4 target problem, 6 preparation failed, 0 ok.
 
 set -u
 
 MB=1048576
-UBOOT_MAGIC="16 00 00 ea 65 47 4f 4e"
-RUNDIR=/run/ota-flash
-BUSYBOX="$RUNDIR/bin/busybox"
+EXTLINUX=/boot/extlinux/extlinux.conf
+BAK=/boot/extlinux/extlinux.conf.bak
+INITRAMFS=/boot/flash-initramfs.gz
+LABEL=flash
 
 die() { echo "[error] $*" >&2; exit "$2"; }
 
 usage() {
 	cat >&2 <<'EOF'
-usage: ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [--no-reboot] [--test]
-  -t <device>   target whole disk (default: the disk holding /)
-  -y            do not ask for confirmation
-  -n            skip read-back verification
-  --no-reboot   do not reboot after a successful write
-  --test        dry run: stream the image to /dev/null, write nothing
+usage: ota-flash <url.img.gz> [-y] [--full] [--no-reboot] [--test]
+       ota-flash --status | --cancel
 EOF
 	exit 1
 }
 
 [ "$(id -u)" = 0 ] || die "must run as root" 1
 
-# ------------------------------------------------------------- tools into RAM
-if [ "${OTA_FLASH_STAGED:-0}" != "1" ]; then
-	case "$(mount | awk '$3 == "/run" { print $5 }')" in
-	tmpfs) ;;
-	*) echo "[warn] /run is not tmpfs: tools may be reloaded from the disk being written" >&2 ;;
-	esac
-	mkdir -p "$RUNDIR/bin" "$RUNDIR/lib" || die "cannot create $RUNDIR (no writable RAM)" 6
-	cp -f /bin/busybox "$RUNDIR/bin/busybox" || die "cannot stage busybox in RAM" 6
-	# musl's loader is the libc on Alpine: take every file it may open
-	for f in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
-		[ -e "$f" ] && cp -f "$f" "$RUNDIR/lib/" 2>/dev/null
-	done
-	cp -f "$0" "$RUNDIR/ota-flash" || die "cannot stage this script in RAM" 6
-	chmod 755 "$RUNDIR/ota-flash" "$RUNDIR/bin/busybox"
-	LOADER=$(ls "$RUNDIR"/lib/ld-musl-*.so.1 2>/dev/null | head -1)
-	[ -n "$LOADER" ] || die "no musl loader staged in $RUNDIR/lib" 6
-	echo "[prep] tools staged in $RUNDIR (tmpfs); re-executing from RAM"
-	OTA_FLASH_STAGED=1 exec "$LOADER" --library-path "$RUNDIR/lib" \
-		"$BUSYBOX" sh "$RUNDIR/ota-flash" "$@"
-fi
-
-
-
 URL=""
-TARGET=""
 ASSUME_YES=0
-VERIFY=1
+MODE=bmap
 NO_REBOOT=0
 TEST=0
+ACTION=arm
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	-t) [ $# -ge 2 ] || usage; TARGET="$2"; shift 2 ;;
 	-y) ASSUME_YES=1; shift ;;
-	-n) VERIFY=0; shift ;;
-	-r) shift ;;                 # rebooting after success is the default now
+	--full) MODE=full; shift ;;
 	--no-reboot) NO_REBOOT=1; shift ;;
 	--test) TEST=1; shift ;;
+	--status) ACTION=status; shift ;;
+	--cancel) ACTION=cancel; shift ;;
 	-h|--help) usage ;;
 	-*) usage ;;
 	*) [ -z "$URL" ] || usage; URL="$1"; shift ;;
 	esac
 done
 
-[ -n "$URL" ] || usage
-case "$URL" in
-http://*|https://*) ;;
-*) die "only http:// and https:// URLs are supported (got '$URL')" 1 ;;
-esac
+# ------------------------------------------------------- boot configuration
+[ -f "$EXTLINUX" ] || die "no $EXTLINUX: this image has no boot menu to arm" 2
 
-for tool in wget gzip dd sha256sum od awk sed wc head grep; do
-	"$BUSYBOX" --list 2>/dev/null | "$BUSYBOX" grep -qx "$tool" ||
-		die "staged busybox lacks the $tool applet" 6
-done
-
-# ---------------------------------------------------------------- target disk
 whole_disk_of() { # $1 = partition or disk node name -> whole disk node name
 	case "$1" in
 	*nvme*|*mmcblk*) case "$1" in *p[0-9]*) printf '%s' "${1%p[0-9]*}" ;; *) printf '%s' "${1%[0-9]}" ;; esac ;;
@@ -123,177 +80,196 @@ whole_disk_of() { # $1 = partition or disk node name -> whole disk node name
 	esac
 }
 
-ROOT_PART=""
-ROOT_WHOLE=""
-root_block() { # sets ROOT_PART (e.g. mmcblk2p1) and ROOT_WHOLE (e.g. mmcblk2)
-	majmin=$("$BUSYBOX" awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
-	[ -n "$majmin" ] || return 1
-	link=$("$BUSYBOX" readlink -f "/sys/dev/block/$majmin") || return 1
-	ROOT_PART=$("$BUSYBOX" basename "$link")
-	ROOT_WHOLE=$(whole_disk_of "$ROOT_PART")
+flash_append() { # print the APPEND line of the flash label
+	awk -v want="$LABEL" '
+		$1 == "LABEL" { inlabel = ($2 == want) }
+		inlabel && $1 == "APPEND" { sub(/^[ \t]*APPEND[ \t]+/, ""); print; exit }
+	' "$EXTLINUX"
 }
 
-root_block || true
+boot_default() {
+	awk '$1 == "DEFAULT" { print $2; exit }' "$EXTLINUX"
+}
 
-if [ "$TEST" = 1 ]; then
-	TARGET=/dev/null
-elif [ -z "$TARGET" ]; then
-	[ -n "$ROOT_WHOLE" ] || die "cannot determine the disk holding /" 2
-	TARGET="/dev/$ROOT_WHOLE"
-else
-	[ -b "$TARGET" ] || die "$TARGET is not a block device" 2
-	base=$("$BUSYBOX" basename "$TARGET")
-	whole=$(whole_disk_of "$base")
-	[ "$whole" = "$base" ] || die "$TARGET is a partition; pass the whole disk (/$whole)" 2
+label_field() { # $1 = field name in the flash label (LINUX/FDT/INITRD)
+	awk -v want="$LABEL" -v f="$1" '
+		$1 == "LABEL" { inlabel = ($2 == want) }
+		inlabel && $1 == f { print $2; exit }
+	' "$EXTLINUX"
+}
+
+param_of() { # $1 = parameter name in the armed APPEND line
+	flash_append | sed -n "s/.*$1=\([^ ]*\).*/\1/p"
+}
+
+if [ "$ACTION" = status ]; then
+	echo "boot default : $(boot_default)"
+	echo "armed url    : $(param_of ota_url)"
+	echo "armed sha256 : $(param_of ota_sha256)"
+	echo "armed mode   : $(param_of ota_mode)"
+	echo "armed target : $(param_of ota_target)"
+	if [ -f "$BAK" ]; then echo "backup       : $BAK present"; else echo "backup       : none"; fi
+	echo "flash kernel : $(label_field LINUX)"
+	echo "flash initrd : $(label_field INITRD)"
+	exit 0
 fi
 
-if [ "$TEST" = 1 ]; then
-	TARGET_SIZE=0
-	SAME_AS_ROOT=0
-else
-	[ -b "$TARGET" ] || die "$TARGET is not a block device" 2
-	DEVNAME=$("$BUSYBOX" basename "$TARGET")
-	SIZE_SECTORS=$("$BUSYBOX" cat "/sys/class/block/$DEVNAME/size" 2>/dev/null) || die "no sysfs entry for $DEVNAME" 2
-	TARGET_SIZE=$((SIZE_SECTORS * 512))
-	case "$TARGET" in
-	/dev/"$ROOT_WHOLE") SAME_AS_ROOT=1 ;;
-	*) SAME_AS_ROOT=0 ;;
-	esac
+if [ "$ACTION" = cancel ]; then
+	[ -f "$BAK" ] || die "no $BAK: nothing to restore" 2
+	cp -f "$BAK" "$EXTLINUX" || die "cannot restore $EXTLINUX" 6
+	sync
+	echo "[done] restored $EXTLINUX (boot default is now $(boot_default))"
+	echo "[done] the next boot runs the installed system as before"
+	exit 0
 fi
 
-# -------------------------------------------------------------- source + meta
-# sidecars sit next to the image: <name>.img.gz -> <name>.img.sha256/.img.size
+[ -n "$URL" ] || usage
+case "$URL" in
+http://*|https://*) ;;
+*) die "only http:// and https:// URLs are supported (got '$URL')" 1 ;;
+esac
+
+# Flash mode has to be present on the card: label, kernel, device tree, initramfs.
+[ "$(label_field LINUX)" != "" ] || die "no LABEL $LABEL in $EXTLINUX" 2
+[ "$(label_field INITRD)" != "" ] || die "LABEL $LABEL has no INITRD" 2
+[ -f "$INITRAMFS" ] || die "$INITRAMFS is missing: rebuild the image with flash mode" 2
+[ -f "$(label_field LINUX)" ] ||
+	die "$(label_field LINUX) (from LABEL $LABEL) does not exist" 2
+[ -f "$(label_field INITRD)" ] ||
+	die "$(label_field INITRD) (from LABEL $LABEL) does not exist" 2
+
+# ---------------------------------------------------------------- target disk
+ROOT_PART=""
+ROOT_WHOLE=""
+majmin=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+if [ -n "$majmin" ]; then
+	link=$(readlink -f "/sys/dev/block/$majmin") || link=""
+	if [ -n "$link" ]; then
+		ROOT_PART=$(basename "$link")
+		ROOT_WHOLE=$(whole_disk_of "$ROOT_PART")
+	fi
+fi
+[ -n "$ROOT_WHOLE" ] || die "cannot determine the disk holding /" 4
+[ "$ROOT_PART" != "$ROOT_WHOLE" ] ||
+	die "/ is mounted from /dev/$ROOT_WHOLE itself, not a partition: refusing" 4
+TARGET=/dev/$ROOT_WHOLE
+ROOTPART=/dev/$ROOT_PART
+[ -b "$TARGET" ] || die "$TARGET is not a block device" 4
+SECTORS=$(cat "/sys/class/block/$ROOT_WHOLE/size" 2>/dev/null) ||
+	die "no sysfs entry for $ROOT_WHOLE" 4
+TARGET_SIZE=$((SECTORS * 512))
+
+# --------------------------------------------------------------- source check
 BASE="${URL%.gz}"
 SIDE_SHA="${BASE}.sha256"
 SIDE_SIZE="${BASE}.size"
+SIDE_BMAP="${BASE}.bmap"
 
 echo "[source]"
 echo "  url        : $URL"
 echo "  sha256     : $SIDE_SHA"
 echo "  size       : $SIDE_SIZE"
+echo "  bmap       : $SIDE_BMAP"
 echo "[target]"
 echo "  device     : $TARGET"
 echo "  size       : $TARGET_SIZE bytes ($((TARGET_SIZE / MB)) MiB)"
-[ "$SAME_AS_ROOT" = 1 ] && echo "  note       : this disk carries the running system"
+echo "  root       : $ROOTPART"
 
-"$BUSYBOX" wget -q -T 15 --spider "$URL" || die "source not reachable: $URL" 3
+wget -q -T 15 --spider "$URL" || die "source not reachable: $URL" 3
 
+fetch() { # $1 = url, $2 = output file; nonzero when unavailable or empty
+	wget -q -T 15 -O "$2" "$1" 2>/dev/null && [ -s "$2" ]
+}
+
+TMP=$(mktemp -d) || die "cannot create a temporary directory" 6
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+EXPECT_SHA=""
 EXPECT_SIZE=""
-EXPECT_HASH=""
-if "$BUSYBOX" wget -q -T 15 -O - "$SIDE_SHA" > "$RUNDIR/.sha" 2>/dev/null && [ -s "$RUNDIR/.sha" ]; then
-	EXPECT_HASH=$("$BUSYBOX" awk '{ print $1; exit }' "$RUNDIR/.sha")
+HAVE_BMAP=0
+fetch "$SIDE_SHA" "$TMP/sha" && EXPECT_SHA=$(awk '{ print $1; exit }' "$TMP/sha")
+fetch "$SIDE_SIZE" "$TMP/size" && EXPECT_SIZE=$(awk '{ print $1; exit }' "$TMP/size")
+[ -n "$EXPECT_SHA" ] || die "cannot fetch $SIDE_SHA: refusing to arm unverified" 3
+[ -n "$EXPECT_SIZE" ] || die "cannot fetch $SIDE_SIZE: refusing to arm" 3
+case "$EXPECT_SHA" in *[!0-9a-fA-F]*|'') die "malformed sha256: $EXPECT_SHA" 3 ;; esac
+[ "${#EXPECT_SHA}" = 64 ] || die "sha256 is ${#EXPECT_SHA} characters, not 64" 3
+case "$EXPECT_SIZE" in *[!0-9]*) die "malformed size: $EXPECT_SIZE" 3 ;; esac
+if [ "$TARGET_SIZE" -lt "$EXPECT_SIZE" ]; then
+	die "target is too small: image needs $EXPECT_SIZE bytes, $TARGET holds $TARGET_SIZE" 4
 fi
-if "$BUSYBOX" wget -q -T 15 -O - "$SIDE_SIZE" > "$RUNDIR/.size" 2>/dev/null && [ -s "$RUNDIR/.size" ]; then
-	EXPECT_SIZE=$("$BUSYBOX" awk '{ print $1; exit }' "$RUNDIR/.size")
-fi
-rm -f "$RUNDIR/.sha" "$RUNDIR/.size"
 
-if [ -z "$EXPECT_HASH" ] && [ "$VERIFY" = 1 ]; then
-	die "no usable $SIDE_SHA: cannot verify the image (use -n to skip verification)" 3
-fi
-if [ "$TEST" = 0 ] && [ -n "$EXPECT_SIZE" ] && [ "$TARGET_SIZE" -lt "$EXPECT_SIZE" ]; then
-	die "target is too small: image needs $EXPECT_SIZE bytes, $TARGET has $TARGET_SIZE" 2
-fi
-[ -n "$EXPECT_SIZE" ] || echo "[warn] no $SIDE_SIZE: skipping the size check"
-[ -n "$EXPECT_HASH" ] || echo "[warn] no $SIDE_SHA: skipping the checksum check"
-
-if [ "$TEST" = 0 ]; then
-	echo
-	echo "Every byte on $TARGET will be replaced: partition table, bootloader,"
-	echo "rootfs. The old install on it is gone afterwards."
-	if [ "$SAME_AS_ROOT" = 1 ]; then
-		echo "This is the disk you booted from: if the transfer breaks half way"
-		echo "you will have to re-flash that card in a reader."
+if [ "$MODE" = bmap ]; then
+	if fetch "$SIDE_BMAP" "$TMP/bmap"; then
+		HAVE_BMAP=1
+		BMAP_SIZE=$(awk '/<ImageSize>/ { gsub(/<[^>]*>/, " "); print $1; exit }' "$TMP/bmap")
+		[ "$BMAP_SIZE" = "$EXPECT_SIZE" ] ||
+			die "bmap describes $BMAP_SIZE bytes but the image is $EXPECT_SIZE" 3
+		echo "  bmap ranges: $(grep -c '<Range' "$TMP/bmap")"
+	else
+		echo "[warn] no $SIDE_BMAP: falling back to a full write" >&2
+		MODE=full
 	fi
-	echo
 fi
 
-if [ "$TEST" = 0 ] && [ "$ASSUME_YES" = 0 ]; then
-	printf 'Type the exact device to proceed (%s): ' "$TARGET"
-	read -r answer
-	[ "$answer" = "$TARGET" ] || die "aborted by user" 2
-fi
+PARAMS="rdinit=/init console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7"
+PARAMS="$PARAMS video=HDMI-A-1:1920x1080@60e panic=30"
+PARAMS="$PARAMS ota_url=$URL ota_sha256=$EXPECT_SHA ota_size=$EXPECT_SIZE"
+PARAMS="$PARAMS ota_target=$TARGET ota_rootpart=$ROOTPART ota_mode=$MODE"
+PARAMS="$PARAMS ota_hostname=$(hostname)"
+[ "$HAVE_BMAP" = 1 ] && PARAMS="$PARAMS ota_bmap=$SIDE_BMAP"
 
-# --------------------------------------------------------- prepare the system
-if [ "$TEST" = 0 ]; then
-	echo "[prep] syncing"
-	"$BUSYBOX" sync
-	echo "[prep] remounting / read-only"
-	if ! "$BUSYBOX" mount -o remount,ro "/dev/$ROOT_PART" / 2>/dev/null &&
-	   ! "$BUSYBOX" mount -o remount,ro / 2>/dev/null; then
-		die "could not remount / read-only: refusing to write, since ext4
-       writeback from a live / would land inside the new image" 6
-	fi
-	if "$BUSYBOX" mount | "$BUSYBOX" grep " on / type" | "$BUSYBOX" grep -qv "(ro,"; then
-		die "the remount reported success but / is still writable" 6
-	fi
-	echo "[prep] / is read-only"
-	[ -w /proc/sys/vm/drop_caches ] && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-fi
-
-# ------------------------------------------------------------------ write
-start=$("$BUSYBOX" date +%s)
+echo
+echo "Next boot runs flash mode instead of this system:"
+echo "  $PARAMS"
+echo
 
 if [ "$TEST" = 1 ]; then
-	echo "[test] streaming $URL through gzip, writing nothing"
-	got=$("$BUSYBOX" wget -q -T 20 -O - "$URL" | "$BUSYBOX" gzip -dc | "$BUSYBOX" wc -c)
-	status=$?
-	elapsed=$(( $("$BUSYBOX" date +%s) - start ))
-	[ "$status" = 0 ] || die "stream failed (wget/gzip exit $status)" 5
-	echo "[test] decompressed $got bytes in ${elapsed}s"
-	if [ -n "$EXPECT_SIZE" ]; then
-		[ "$got" = "$EXPECT_SIZE" ] || die "size mismatch: got $got, published $EXPECT_SIZE" 4
-		echo "[test] size matches the published $SIDE_SIZE"
-	else
-		echo "[warn] nothing to compare the stream against: no $SIDE_SIZE"
-	fi
-	echo "[done] dry run complete: source, sidecars and the streaming chain work"
+	echo "[test] source, metadata and target check out; nothing armed"
+	echo "[test] a real run would back up $EXTLINUX, set DEFAULT $LABEL and reboot"
 	exit 0
 fi
 
-echo "[write] streaming $URL -> $TARGET"
-if ! "$BUSYBOX" wget -q -T 30 -O - "$URL" | "$BUSYBOX" gzip -dc |
-     "$BUSYBOX" dd of="$TARGET" bs=4M conv=fsync 2>/dev/null; then
-	echo "[error] write failed; the target may hold a partial image and need a" >&2
-	echo "        re-flash from a card reader on another machine" >&2
-	echo "        (a truncated stream is only detected by the read-back below)" >&2
-	exit 5
-fi
-"$BUSYBOX" sync
-echo "[write] done in $(( $("$BUSYBOX" date +%s) - start ))s"
-
-# ------------------------------------------------------------------ verify
-magic=$("$BUSYBOX" dd if="$TARGET" bs=1 skip=8192 count=8 2>/dev/null | "$BUSYBOX" od -A n -t x1 |
-	"$BUSYBOX" sed 's/^ *//; s/  */ /g; s/ *$//')
-echo "[verify] u-boot magic at KiB 8: $magic"
-case "$magic" in
-"$UBOOT_MAGIC"*) echo "[verify] bootloader present" ;;
-*) echo "[error] bootloader magic missing: the image is wrong or the write failed" >&2; exit 4 ;;
-esac
-
-if [ "$VERIFY" = 1 ]; then
-	size=${EXPECT_SIZE:-$TARGET_SIZE}
-	blocks=$(( (size + 4 * MB - 1) / (4 * MB) ))
-	echo "[verify] hashing $((size / MB)) MiB read back from $TARGET"
-	got=$("$BUSYBOX" dd if="$TARGET" bs=4M count="$blocks" 2>/dev/null | "$BUSYBOX" head -c "$size" |
-		"$BUSYBOX" sha256sum | "$BUSYBOX" awk '{ print $1 }')
-	if [ "$got" = "$EXPECT_HASH" ]; then
-		echo "[verify] sha256 matches"
-	else
-		echo "[error] sha256 mismatch" >&2
-		echo "  expected $EXPECT_HASH" >&2
-		echo "  got      $got" >&2
-		echo "  re-run ota-flash, or re-flash the card in a reader" >&2
-		exit 4
-	fi
+if [ "$ASSUME_YES" = 0 ]; then
+	printf 'Arm flash mode and reboot into it? (yes/no) '
+	read -r answer
+	[ "$answer" = "yes" ] || die "aborted by user" 4
 fi
 
-"$BUSYBOX" sync
-echo "[done] image written and verified"
+# ------------------------------------------------------------------- arming
+if [ "$(boot_default)" = "$LABEL" ]; then
+	echo "[warn] DEFAULT is already $LABEL: keeping the existing $BAK" >&2
+else
+	cp -f "$EXTLINUX" "$BAK" || die "cannot write $BAK" 6
+	echo "[prep] saved the current boot configuration to $BAK"
+fi
+
+awk -v want="$LABEL" -v params="$PARAMS" '
+	$1 == "LABEL" { inlabel = ($2 == want); print; next }
+	inlabel && $1 == "APPEND" { print "  APPEND " params; next }
+	{ print }
+' "$EXTLINUX" > "$TMP/conf" || die "cannot edit $EXTLINUX" 6
+
+awk -v want="$LABEL" '
+	$1 == "DEFAULT" && !done { print "DEFAULT " want; done = 1; next }
+	{ print }
+' "$TMP/conf" > "$TMP/conf2" || die "cannot set the boot default" 6
+
+[ "$(awk '$1 == "DEFAULT" { print $2 }' "$TMP/conf2")" = "$LABEL" ] ||
+	die "the edited configuration has no DEFAULT $LABEL" 6
+grep -q "APPEND .*ota_url=$URL" "$TMP/conf2" ||
+	die "the edited configuration does not carry ota_url" 6
+
+cat "$TMP/conf2" > "$EXTLINUX" || die "cannot write $EXTLINUX" 6
+sync
+
+echo "[done] armed: DEFAULT is $(boot_default), LABEL $LABEL carries the image URL"
+echo "[note] the next boot downloads and writes $TARGET from RAM, with this OS not running"
+echo "[note] a failure before the first byte restores $BAK and boots this system again"
+echo "[note] 'ota-flash --cancel' before rebooting undoes the arming"
 
 if [ "$NO_REBOOT" = 1 ]; then
-	echo "[done] / no longer matches the disk: reboot manually"
+	echo "[done] not rebooting (--no-reboot)"
 	exit 0
 fi
-echo "[done] rebooting into the new image"
-"$BUSYBOX" reboot -f
+echo "[done] rebooting into flash mode"
+reboot
