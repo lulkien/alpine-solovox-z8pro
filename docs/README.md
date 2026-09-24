@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 7f9d53b964f00121b4f0bca05996ceb261a32b5ec52573d9d0cd09835fe5dae2
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 719f9ecfcf6a7b71083d8cb650ba91ead3d349d99e1760aba5550001adc2e47a
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -79,6 +79,9 @@ LABEL debug        # explicit /dev/mmcblk0p1, no rootwait, loglevel=8
          panic=15 console=ttyS0,115200 console=tty0 ...
 LABEL mainline     # Alpine 6.12.110, no wired Ethernet
   LINUX /boot/vmlinuz-lts
+LABEL flash        # flash mode: RAM-only initramfs, writes an image, no OS
+  LINUX /boot/vmlinuz-6.18.53-ophub
+  INITRD /boot/flash-initramfs.gz
 ```
 
 `root=PARTUUID=` (not `UUID=`) is used so the same image boots from SD and from
@@ -127,62 +130,156 @@ and silently, so nothing is logged.
   helper: `mdev.conf` rules only run at coldplug, so hotplugged devices get
   their devtmpfs node but no per-owner/mode fixup or `$MODALIAS` autoload.
 
-## OTA reflash over HTTP
+## OTA reflash over HTTP (flash mode)
 
-The image ships `/usr/sbin/ota-flash` (source `board/ota-flash`). It streams a
-gzip-compressed image from an HTTP URL through `gzip -dc | dd` onto a whole disk
-(default: the disk holding `/`), remounting `/` read-only first for the duration
-of the write, then verifies what actually landed: the u-boot magic at KiB 8 and
-a sha256 read-back of the written region against the published hash. Nothing is
-downloaded to local storage — the target medium holds the running rootfs, so a
-local copy would be overwritten by the very write it feeds.
+Two pieces ship in the image:
 
-Artifacts are published by `scripts/04-ota-publish.sh` to the NAS (`luna`),
-where the `deploy/ota-images.container` quadlet serves `~/ota-images` read-only
-on port 8080:
+- `/usr/sbin/ota-flash` (source `board/ota-flash`) arms the next boot.
+- a `flash` extlinux label and `/boot/flash-initramfs.gz` are flash mode itself.
+
+`ota-flash <url>` writes nothing. It checks the URL and its sidecars, bakes the
+image URL, its sha256, size, bmap and the target disk into the `flash` label,
+saves `/boot/extlinux/extlinux.conf.bak`, sets `DEFAULT flash` and reboots. The
+next boot runs the initramfs instead of the OS: kernel and userspace come from
+RAM, no rootfs is mounted, and the only thing touching the card is `dd`. That is
+the point of the design. Writing the boot medium from the running OS put ext4
+writeback inside the image being written, and the flasher's own executables were
+read back from the blocks `dd` was overwriting.
+
+Flash mode sequence (`board/flash-init`): read the `ota_*` parameters from the
+kernel command line, bring `eth0` up over DHCP, fetch the bmap, stream the `.gz`
+through gzip writing only the mapped ranges, verify every range by reading it
+back, check the u-boot magic at KiB 8, reboot. The freshly written image has
+`DEFAULT bsp`, so the box comes up in the OS.
+
+Recovery, and the two outcomes are different:
+
+- A failure **before the first byte is written** — no DHCP lease, sidecar
+  missing, bmap inconsistent with the image, or a target that is not zero
+  outside the mapped ranges — restores `extlinux.conf.bak`, syncs and reboots:
+  the installed system starts as if nothing had happened. `ota-flash --cancel`
+  undoes the arming before that reboot as well.
+- A failure **after the write starts** leaves a partly written disk. Nothing on
+  the machine can recover it: pull the card and flash it in a reader.
 
 ```
-# on this host: compress, write sidecars, copy to luna:~/ota-images, verify
+# on this host: compress, build the bmap, write the sidecars, publish a release
+# folder to the NAS and verify it over HTTP
 scripts/04-ota-publish.sh
 
-# on the board: stream everything, write nothing (do this first)
-ota-flash http://10.21.50.12:8080/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz --test -y
+# on the board: check the source and the metadata, change nothing
+ota-flash http://10.21.50.12:8080/latest/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz --test
 
-# on the board: the real thing
-ota-flash http://10.21.50.12:8080/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz
+# on the board: arm flash mode and reboot into it
+ota-flash http://10.21.50.12:8080/latest/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz
+
+# inspect or undo the arming before rebooting
+ota-flash --status
+ota-flash --cancel
 ```
 
-Sidecars sit next to the `.gz` and are derived from its URL:
-`<name>.img.sha256` (sha256 of the raw image) and `<name>.img.size` (its size in
-bytes). Options: `-t /dev/mmcblkX` target disk, `-y` no prompt, `-n` skip the
-read-back, `-r` reboot without asking, `--test` dry run. Exit codes: 1
-usage/root, 2 target problem, 3 source unreachable, 4 checksum mismatch, 5 write
-failed.
+### Release folders
 
-Risks, stated plainly: ota-flash rewrites the disk it booted from, so an
-interrupted transfer leaves a partially written card that has to be re-flashed
-in a reader. Verify the image boots on a card flashed in a reader before using
-it as an OTA source, and use `--test` to check URL, sidecars and the streaming
-chain in advance.
+One build, one folder. `scripts/04-ota-publish.sh` writes it under
+`/srv/remotemount/OTA` on the NAS — an NFS mount from `10.21.50.10`, so releases
+live on the storage host rather than in a home directory:
 
-Two properties are enforced before the first byte is written, because the
-medium being written is the one holding the running system:
+```
+alpine-solovox-z8pro-3.22.6-6.18.53-20260924-205512/
+  alpine-solovox-z8pro-3.22.6-6.18.53.img.gz       transfer artifact
+  alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256   sha256 of the raw image
+  alpine-solovox-z8pro-3.22.6-6.18.53.img.size     size of the raw image
+  alpine-solovox-z8pro-3.22.6-6.18.53.img.bmap     block map for the sparse write
+  SHA256SUMS                                        the files above with hashes
+latest -> <newest release>                          relative symlink
+```
 
-- **Tools in RAM.** `wget`, `gzip`, `dd`, `od`, `sha256sum` and the shell
-  reading the script are all busybox. The flasher copies busybox, its musl
-  loader and itself into `/run` (tmpfs) and re-executes from there first;
-  otherwise a page fault mid-write re-reads an executable from a filesystem
-  that was just overwritten.
-- **`/` read-only.** If `/` is still writable when the write starts, ext4
-  writeback puts dirty metadata inside the freshly written image. The remount is
-  attempted with the root partition explicitly and then without a source, and
-  the flags are re-read afterwards; a failed remount aborts the flash with exit
-  6 instead of warning and continuing.
+The folder name is the image name plus the time of the publish, so rebuilding
+never overwrites an older release and an old image stays fetchable. Check a
+release by hand with `sha256sum -c SHA256SUMS` inside its folder.
 
-Both are guards, not guarantees: the target medium still holds the running
-kernel's view of the world until the reboot. The alternative that removes the
-hazard entirely is an A/B layout (two rootfs partitions plus a switchable
-extlinux label), which this image does not have.
+`deploy/ota-images.container` serves that base read-only as its HTTP root on
+port 8080, so the release-pinned URL is
+`http://10.21.50.12:8080/<release>/<name>.img.gz` and the dated `latest`
+symlink gives the same file a stable name. `--flat` publishes straight into the
+base with no release folder, `--local` skips the NAS and serves `image/` from
+the build host.
+
+Options: `-y` skip the prompt, `--full` write every byte instead of the mapped
+blocks, `--no-reboot` arm without rebooting, `--test` check only. Exit codes: 1
+usage/root, 2 boot configuration problem, 3 source unreachable, 4 target
+problem, 6 preparation failed.
+
+Sidecars sit next to the `.gz` and are derived from its URL: `<name>.img.sha256`
+(sha256 of the raw image), `<name>.img.size` (bytes) and `<name>.img.bmap`
+(`SHA256SUMS` covers the artifacts in the folder themselves).
+The bmap is generated by `tools/mkbmap.py` and carries a sha256 per range. It is
+not bmaptool's format: ours is `<Ranges>` with start-plus-length spans, where
+`bmaptool` writes `<BlockMap>` with `start` / `start-end` spans and a
+`<BmapFileChecksum>` element, so neither tool can read the other's file (feeding
+ours to `bmaptool` fails outright). Measured against this writer on the same
+target, bmaptool was not faster, and Alpine has no bmaptool package for the
+initramfs anyway, so the bmap stays ours.
+
+The map skips roughly 70% of the image, so flash mode writes about 1.2 GiB
+instead of 4 GiB. Unmapped blocks are never written and the image is zero there,
+so the target must already hold zeros outside the mapped ranges. A card that
+already held a different image does not: its old bytes survive in those gaps and
+the result is a disk that is not the image it claims to be, verified ranges and
+all. Flash mode therefore checks the gaps *before* it writes anything, and
+refuses a target that fails — a failure before the first byte, so the installed
+system is still intact and the fix is to re-arm with `--full`, which writes
+every byte.
+
+### Filling the card
+
+The image is built at a fixed 4096 MiB. On a bigger card, flash mode hands the
+rest of the card to the root partition after the write has been verified — one
+4-byte write to the partition table — and reboots. That order is what makes it
+possible: the table can only be re-read while nothing is mounted from it, so it
+has to happen in flash mode rather than from the running system. The flasher
+grows the partition only; the filesystem is grown by the image itself on the
+next boot, by the `growfs` service in the boot runlevel. It compares the
+filesystem size (`tune2fs -l`) with its partition's size
+(`/sys/class/block/*/size`) and runs `resize2fs` only when there is something to
+grow — growing a mounted ext4 is supported, and the comparison makes it a no-op
+on every later boot. `ota_fill=0` on the `flash` label skips the extension.
+
+`tests/qemu-flash-mode.sh` exercises both paths for real without the board. It
+boots the image's own kernel and initramfs on QEMU's `virt` machine with a disk
+file as `ota_target` and an HTTP server standing in for the NAS, then checks that
+a successful flash leaves the target byte-identical to the image, and that an
+abort before the first byte restores the boot configuration from the backup and
+leaves the rest of the target untouched.
+
+`tests/qemu-flash-small.sh` runs the same chain against a 16 MiB fixture in
+seconds, which is the one to run on every change. Its target is larger than the
+fixture on purpose, so the partition extension runs for real; the reference is
+patched with the same 4 bytes before the comparison, and the harness reads the
+target's partition entry back to confirm what the guest wrote. `POISON=1` fills
+the target with random bytes first, so the gap check has to refuse: the write
+never starts, the boot configuration is restored, and the installed system stays
+intact.
+
+## USB hotplug (and why a plugged-in keyboard did nothing)
+
+Two things have to work for a device plugged in after boot, and the image was
+doing neither.
+
+Alpine's `mdev` service populates `/dev` once at boot and then hands hotplug
+duties to the kernel by writing `/sbin/mdev` into `/proc/sys/kernel/hotplug`.
+That is the uevent helper, and this BSP kernel is built without
+`CONFIG_UEVENT_HELPER` — the sysctl exists but stays empty — so nothing runs on
+a hotplug event. A device plugged in later gets no `/dev` node, and its modalias
+never reaches `modprobe`. The `mdev-hotplug` service in the boot runlevel runs
+`mdev -d`, which listens on the kernel's netlink uevents and does that work
+itself.
+
+What made this look like broken hardware: the kernel *did* enumerate the device
+and `usbhid` *did* bind its interfaces, so the device showed up in sysfs while
+`/sys/class/input/` never gained anything and the kernel logged nothing about
+HID at all. A wireless dongle cloning Apple's keyboard id (`05ac:024f`) needs
+the `hid-apple` module, and module loading is exactly what was missing.
 
 ## Clock (this board has no RTC)
 
@@ -263,7 +360,7 @@ Two things about it matter for the build:
 
 ## Build
 
-Four scripts; inputs are fetched and hash-verified first, then each stage runs
+Five scripts; inputs are fetched and hash-verified first, then each stage runs
 through a throwaway container so the host needs no extra tooling — only
 `docker` and `qemu-aarch64` binfmt are required.
 
@@ -275,13 +372,19 @@ bash scripts/00-fetch-inputs.sh
 docker run --rm --privileged -v "$PWD":/work debian:trixie \
   bash /work/scripts/01-bootstrap-rootfs.sh
 
-# 2. board config, BSP kernel + modules, extlinux.conf
-docker run --rm --privileged -v "$PWD":/work debian:trixie \
-  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools && bash /work/scripts/02-configure-rootfs.sh'
+# 2. board config, BSP kernel + modules, extlinux.conf, flash-mode initramfs
+docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
+  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/02-configure-rootfs.sh'
 
 # 3. image: partition table, ext4, rootfs, u-boot at KiB 8  (needs host /dev for losetup)
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
-  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools && bash /work/scripts/03-build-image.sh'
+  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/03-build-image.sh'
+
+# 4. publish a release folder to the NAS: .gz, .sha256, .size, .bmap, SHA256SUMS
+scripts/04-ota-publish.sh
+
+# 5. optional: exercise flash mode end to end without the board
+tests/qemu-flash-mode.sh
 ```
 
 Inputs pulled once into the project tree: the minirootfs tarball, the ophub
