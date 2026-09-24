@@ -77,7 +77,7 @@ mount -o ro "$P1" /mnt/target
 MOUNTED=1
 echo "--- boot tree on image"
 ls -l /mnt/target/boot /mnt/target/boot/extlinux
-for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/dropbear" "/etc/init.d/dropbear" "/etc/runlevels/default/dropbear" "/etc/runlevels/default/ntpd" "/etc/runlevels/boot/swclock" "/etc/conf.d/ntpd"; do
+for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/dropbear" "/etc/init.d/dropbear" "/etc/runlevels/default/dropbear" "/etc/runlevels/default/ntpd" "/etc/runlevels/boot/swclock" "/etc/conf.d/ntpd" "/usr/sbin/ota-flash"; do
   # -L as well: /sbin/init is an absolute symlink and does not resolve on the host
   [ -e "/mnt/target$chk" ] || [ -L "/mnt/target$chk" ] || { echo "MISSING on image: $chk" >&2; exit 1; }
 done
@@ -97,3 +97,6 @@ LOOP=""
 echo "--- image"
 ls -lh "$IMG"
 sha256sum "$IMG" | tee "$IMG.sha256"
+# The build runs as root inside the container; hand the artifacts to whoever
+# owns the workspace so later steps (publish) can rewrite the sidecars.
+chown "$(stat -c '%u:%g' "$WORK")" "$IMG" "$IMG.sha256"

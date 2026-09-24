@@ -1,0 +1,253 @@
+#!/bin/sh
+# ota-flash: flash this board from a gzip-compressed image served over HTTP.
+#
+# Streams  <url>  through gzip into dd on the boot medium (SD card now, eMMC
+# later), then verifies what actually landed: the u-boot magic at KiB 8 and a
+# sha256 read-back of the written region against the published hash.
+#
+# Nothing is downloaded to disk first: the target medium holds the running
+# rootfs, so a local copy would be overwritten by the write it feeds.
+#
+# Publish the artifacts from the build host with scripts/04-ota-serve.sh:
+#   image/alpine-solovox-z8pro-<ver>.img.gz          the transfer artifact
+#   image/alpine-solovox-z8pro-<ver>.img.sha256      sha256 of the raw image
+#   image/alpine-solovox-z8pro-<ver>.img.size        size of the raw image
+#
+# Usage:
+#   ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [-r] [--test]
+#     -t <device>  target whole disk (default: the disk holding /)
+#     -y           skip the confirmation prompt (still refuses unsafe targets)
+#     -n           skip the read-back verification (much faster, less safe)
+#     -r           reboot without asking once the write succeeded
+#     --test       dry run: stream the image to /dev/null, write nothing.
+#
+# Exit codes: 1 usage/root, 2 target problem, 3 source not reachable,
+#             4 checksum mismatch, 5 write failed, 0 success.
+
+set -u
+
+MB=1048576
+UBOOT_MAGIC="16 00 00 ea 65 47 4f 4e"
+
+die() { echo "[error] $*" >&2; exit "$2"; }
+
+usage() {
+	cat >&2 <<'EOF'
+usage: ota-flash <url.img.gz> [-t /dev/mmcblkX] [-y] [-n] [-r] [--test]
+  -t <device>  target whole disk (default: the disk holding /)
+  -y           do not ask for confirmation
+  -n           skip read-back verification
+  -r           reboot without asking after success
+  --test       dry run: stream the image to /dev/null, write nothing
+EOF
+	exit 1
+}
+
+[ "$(id -u)" = 0 ] || die "must run as root" 1
+
+URL=""
+TARGET=""
+ASSUME_YES=0
+VERIFY=1
+AUTO_REBOOT=0
+TEST=0
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-t) [ $# -ge 2 ] || usage; TARGET="$2"; shift 2 ;;
+	-y) ASSUME_YES=1; shift ;;
+	-n) VERIFY=0; shift ;;
+	-r) AUTO_REBOOT=1; shift ;;
+	--test) TEST=1; shift ;;
+	-h|--help) usage ;;
+	-*) usage ;;
+	*) [ -z "$URL" ] || usage; URL="$1"; shift ;;
+	esac
+done
+
+[ -n "$URL" ] || usage
+case "$URL" in
+http://*|https://*) ;;
+*) die "only http:// and https:// URLs are supported (got '$URL')" 1 ;;
+esac
+
+for tool in wget gzip dd sha256sum od awk sed wc; do
+	command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool" 1
+done
+
+# ---------------------------------------------------------------- target disk
+whole_disk_of() { # $1 = partition or disk node name -> whole disk node name
+	case "$1" in
+	*nvme*|*mmcblk*) case "$1" in *p[0-9]*) printf '%s' "${1%p[0-9]*}" ;; *) printf '%s' "${1%[0-9]}" ;; esac ;;
+	*sd[a-z]) printf '%s' "$1" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+root_disk() {
+	majmin=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+	[ -n "$majmin" ] || return 1
+	link=$(readlink -f "/sys/dev/block/$majmin") || return 1
+	whole_disk_of "$(basename "$link")"
+}
+
+if [ "$TEST" = 1 ]; then
+	TARGET=/dev/null
+elif [ -z "$TARGET" ]; then
+	disk=$(root_disk) || die "cannot determine the disk holding /" 2
+	TARGET="/dev/$disk"
+else
+	[ -b "$TARGET" ] || die "$TARGET is not a block device" 2
+	# reject a partition: the image carries its own partition table
+	base=$(basename "$TARGET")
+	whole=$(whole_disk_of "$base")
+	[ "$whole" = "$base" ] || die "$TARGET is a partition; pass the whole disk (/$whole)" 2
+fi
+
+if [ "$TEST" = 1 ]; then
+	TARGET_SIZE=0
+	SAME_AS_ROOT=0
+else
+	[ -b "$TARGET" ] || die "$TARGET is not a block device" 2
+	DEVNAME=$(basename "$TARGET")
+	SIZE_SECTORS=$(cat "/sys/class/block/$DEVNAME/size" 2>/dev/null) || die "no sysfs entry for $DEVNAME" 2
+	TARGET_SIZE=$((SIZE_SECTORS * 512))
+
+	ROOT_DISK_NODE=$(root_disk || echo "")
+	case "$TARGET" in
+	/dev/"$ROOT_DISK_NODE") SAME_AS_ROOT=1 ;;
+	*) SAME_AS_ROOT=0 ;;
+	esac
+fi
+
+# -------------------------------------------------------------- source + meta
+# sidecars sit next to the image: <name>.img.gz -> <name>.img.sha256/.img.size
+BASE="${URL%.gz}"
+SIDE_SHA="${BASE}.sha256"
+SIDE_SIZE="${BASE}.size"
+
+echo "[source]"
+echo "  url        : $URL"
+echo "  sha256     : $SIDE_SHA"
+echo "  size       : $SIDE_SIZE"
+
+echo "[target]"
+echo "  device     : $TARGET"
+echo "  size       : $TARGET_SIZE bytes ($((TARGET_SIZE / MB)) MiB)"
+if [ "$SAME_AS_ROOT" = 1 ]; then
+	echo "  note       : this disk carries the running system"
+fi
+
+wget -q --spider "$URL" || die "source not reachable: $URL" 3
+
+EXPECT_SIZE=""
+EXPECT_HASH=""
+if wget -q -O - "$SIDE_SHA" > /tmp/.ota.sha 2>/dev/null && [ -s /tmp/.ota.sha ]; then
+	EXPECT_HASH=$(awk '{ print $1; exit }' /tmp/.ota.sha)
+fi
+if wget -q -O - "$SIDE_SIZE" > /tmp/.ota.size 2>/dev/null && [ -s /tmp/.ota.size ]; then
+	EXPECT_SIZE=$(awk '{ print $1; exit }' /tmp/.ota.size)
+fi
+rm -f /tmp/.ota.sha /tmp/.ota.size
+
+if [ -z "$EXPECT_HASH" ] && [ "$VERIFY" = 1 ]; then
+	die "no usable $SIDE_SHA: cannot verify the image (use -n to skip verification)" 3
+fi
+if [ "$TEST" = 0 ] && [ -n "$EXPECT_SIZE" ] && [ "$TARGET_SIZE" -lt "$EXPECT_SIZE" ]; then
+	die "target is too small: image needs $EXPECT_SIZE bytes, $TARGET has $TARGET_SIZE" 2
+fi
+[ -n "$EXPECT_SIZE" ] || echo "[warn] no $SIDE_SIZE: skipping the size check"
+[ -n "$EXPECT_HASH" ] || echo "[warn] no $SIDE_SHA: skipping the checksum check"
+
+if [ "$TEST" = 0 ]; then
+	echo
+	echo "Every byte on $TARGET will be replaced: partition table, bootloader,"
+	echo "rootfs. The old Armbian/Alpine install on it is gone afterwards."
+	if [ "$SAME_AS_ROOT" = 1 ]; then
+		echo "This is the disk you booted from. If the transfer breaks half way you"
+		echo "will have to re-flash that card in a reader."
+	fi
+	echo
+fi
+
+if [ "$TEST" = 0 ] && [ "$ASSUME_YES" = 0 ]; then
+	printf 'Type the exact device to proceed (%s): ' "$TARGET"
+	read -r answer
+	[ "$answer" = "$TARGET" ] || die "aborted by user" 2
+fi
+
+# Writes to the old filesystem would land in the new image; stop them first.
+if [ "$TEST" = 0 ]; then
+	sync
+	if ! mount -o remount,ro / 2>/dev/null; then
+		echo "[warn] could not remount / read-only: keep the system idle until reboot"
+	fi
+fi
+
+start=$(date +%s)
+
+if [ "$TEST" = 1 ]; then
+	echo "[test] streaming $URL through gzip, writing nothing"
+	got=$(wget -q -O - "$URL" | gzip -dc | wc -c)
+	status=$?
+	elapsed=$(( $(date +%s) - start ))
+	[ "$status" = 0 ] || die "stream failed (wget/gzip exit $status)" 5
+	echo "[test] decompressed $got bytes in ${elapsed}s"
+	if [ -n "$EXPECT_SIZE" ]; then
+		[ "$got" = "$EXPECT_SIZE" ] || die "size mismatch: got $got, published $EXPECT_SIZE" 4
+		echo "[test] size matches the published $SIDE_SIZE"
+	else
+		echo "[warn] nothing to compare the stream against: no $SIDE_SIZE"
+	fi
+	echo "[done] dry run complete: source, sidecars and the streaming chain work"
+	exit 0
+fi
+
+echo "[write] streaming $URL -> $TARGET"
+if ! wget -q -O - "$URL" | gzip -dc | dd of="$TARGET" bs=4M conv=fsync 2>/dev/null; then
+	echo "[error] write failed; the target may hold a partial image and need a"
+	echo "        re-flash from a card reader on another machine" >&2
+	echo "        (a truncated stream is only detected by the read-back below)" >&2
+	exit 5
+fi
+sync
+echo "[write] done in $(( $(date +%s) - start ))s"
+
+# ------------------------------------------------------------------ verify
+
+magic=$(dd if="$TARGET" bs=1 skip=8192 count=8 2>/dev/null | od -A n -t x1 | sed 's/^ *//; s/  */ /g; s/ *$//')
+echo "[verify] u-boot magic at KiB 8: $magic"
+case "$magic" in
+"$UBOOT_MAGIC"*) echo "[verify] bootloader present" ;;
+*) echo "[error] bootloader magic missing: the image is wrong or the write failed" >&2; exit 4 ;;
+esac
+
+if [ "$VERIFY" = 1 ]; then
+	size=${EXPECT_SIZE:-$TARGET_SIZE}
+	blocks=$(( (size + 4 * MB - 1) / (4 * MB) ))
+	echo "[verify] hashing $((size / MB)) MiB read back from $TARGET"
+	got=$(dd if="$TARGET" bs=4M count="$blocks" 2>/dev/null | head -c "$size" \
+		| sha256sum | awk '{ print $1 }')
+	if [ "$got" = "$EXPECT_HASH" ]; then
+		echo "[verify] sha256 matches"
+	else
+		echo "[error] sha256 mismatch" >&2
+		echo "  expected $EXPECT_HASH" >&2
+		echo "  got      $got" >&2
+		echo "  re-run ota-flash, or re-flash the card in a reader" >&2
+		exit 4
+	fi
+fi
+
+sync
+echo "[done] image written and verified; the running system is stale now"
+
+if [ "$AUTO_REBOOT" = 1 ]; then
+	reboot -f
+fi
+printf 'Reboot now to boot the new image? (y/N): '
+read -r answer
+case "$answer" in
+y|Y) reboot -f ;;
+*) echo "Reboot as soon as possible: / is read-only and does not match the disk." ;;
+esac

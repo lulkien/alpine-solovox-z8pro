@@ -11,7 +11,7 @@ is what upstream calls this hardware family.
 
 ```
 image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 47642b12ebc63c341ac8af14a12b768f181c47341e248f8da079e3ba8bb0940c
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 65a340d5860bdea0c36e03cca73b95a6b3cd01ff696dfd524273a49c7e7fb039
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -127,6 +127,44 @@ and silently, so nothing is logged.
   helper: `mdev.conf` rules only run at coldplug, so hotplugged devices get
   their devtmpfs node but no per-owner/mode fixup or `$MODALIAS` autoload.
 
+## OTA reflash over HTTP
+
+The image ships `/usr/sbin/ota-flash` (source `board/ota-flash`). It streams a
+gzip-compressed image from an HTTP URL through `gzip -dc | dd` onto a whole disk
+(default: the disk holding `/`), remounting `/` read-only first for the duration
+of the write, then verifies what actually landed: the u-boot magic at KiB 8 and
+a sha256 read-back of the written region against the published hash. Nothing is
+downloaded to local storage — the target medium holds the running rootfs, so a
+local copy would be overwritten by the very write it feeds.
+
+Artifacts are published by `scripts/04-ota-publish.sh` to the NAS (`luna`),
+where the `deploy/ota-images.container` quadlet serves `~/ota-images` read-only
+on port 8080:
+
+```
+# on this host: compress, write sidecars, copy to luna:~/ota-images, verify
+scripts/04-ota-publish.sh
+
+# on the board: stream everything, write nothing (do this first)
+ota-flash http://10.21.50.12:8080/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz --test -y
+
+# on the board: the real thing
+ota-flash http://10.21.50.12:8080/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz
+```
+
+Sidecars sit next to the `.gz` and are derived from its URL:
+`<name>.img.sha256` (sha256 of the raw image) and `<name>.img.size` (its size in
+bytes). Options: `-t /dev/mmcblkX` target disk, `-y` no prompt, `-n` skip the
+read-back, `-r` reboot without asking, `--test` dry run. Exit codes: 1
+usage/root, 2 target problem, 3 source unreachable, 4 checksum mismatch, 5 write
+failed.
+
+Risks, stated plainly: ota-flash rewrites the disk it booted from, so an
+interrupted transfer leaves a partially written card that has to be re-flashed
+in a reader. Verify the image boots on a card flashed in a reader before using
+it as an OTA source, and use `--test` to check URL, sidecars and the streaming
+chain in advance.
+
 ## Clock (this board has no RTC)
 
 Out of the box the clock sat at Jan 2 1970, and every HTTPS fetch failed —
@@ -160,6 +198,8 @@ functional set:
 `dropbear` is the ssh server; the openssh client packages are kept for the
 `ssh`/`scp`/`sftp`/`ssh-keygen` CLIs (the `dropbear-dbclient`/`-ssh`/`-scp`
 variants are not installed). No `dhcpcd`: busybox `udhcpc` is the DHCP client.
+Installed outside the package set: `/usr/sbin/ota-flash` (network reflash, see
+"OTA reflash over HTTP" below).
 
 Login: hostname `solovox`, user `root`, password locked (`/etc/shadow` `root:*`),
 key-only over ssh

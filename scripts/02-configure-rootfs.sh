@@ -133,6 +133,11 @@ sed -i -e 's|^\techo "/sbin/mdev" > /proc/sys/kernel/hotplug|\t[ -e /proc/sys/ke
   "$ROOT/etc/init.d/mdev"
 grep -n "hotplug" "$ROOT/etc/init.d/mdev"
 
+echo "--- board tools"
+# ota-flash: pulls a compressed image over HTTP and writes it to the boot
+# medium, then verifies the bootloader magic and a sha256 read-back.
+install -m 755 "$WORK/board/ota-flash" "$ROOT/usr/sbin/ota-flash"
+
 echo "--- extlinux.conf"
 cat > "$ROOT/boot/extlinux/extlinux.conf" <<EOF
 TIMEOUT 30
